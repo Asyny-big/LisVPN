@@ -1,0 +1,3 @@
+-dontwarn io.ktor.**
+-dontwarn okhttp3.**
+-dontwarn okio.**

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        Compose-only app: Material/AppCompat themes are intentionally NOT used at runtime.
+        This XML theme is the bare minimum needed for the system splash screen,
+        edge-to-edge bars, and PreviewActivity until Compose takes over in setContent.
+    -->
+    <style name="Theme.LisVPN" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/lis_background</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
+        <item name="android:windowLightNavigationBar" tools:targetApi="o_mr1">true</item>
+    </style>
+
+    <style name="Theme.LisVPN.Splash" parent="Theme.LisVPN">
+        <item name="android:windowSplashScreenBackground" tools:targetApi="s">@color/lis_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon" tools:targetApi="s">@drawable/ic_launcher_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor" tools:targetApi="s">@color/lis_background</item>
+    </style>
+
+</resources>

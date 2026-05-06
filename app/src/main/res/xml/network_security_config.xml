@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Strict TLS-only baseline.
+    - Cleartext disabled globally.
+    - Certificate pinning is performed dynamically via Ktor (CertificatePinner) so it can be
+      flavor-toggled (dev disables strict pinning to ease 3x-ui staging).
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

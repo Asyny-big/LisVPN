@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Auto-backup rules: VPN tokens, encrypted profiles, and DataStore are excluded.
+    Re-deriving these from the Telegram bot is preferred over restoring stale credentials.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="file" path="datastore/" />
+    <exclude domain="file" path="encrypted/" />
+</full-backup-content>

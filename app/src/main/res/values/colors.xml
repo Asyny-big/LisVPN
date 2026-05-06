@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Reference-only (Compose owns the palette). Used by splash + system chrome. -->
+    <color name="lis_background">#FFFAF7F2</color>
+    <color name="lis_background_dark">#FF0B0F14</color>
+    <color name="lis_brand">#FFFF8A3D</color>
+</resources>

@@ -1,0 +1,1 @@
+-keep class com.lisvpn.android.vpn.core.LisVpnService { *; }

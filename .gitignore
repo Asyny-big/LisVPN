@@ -1,0 +1,49 @@
+# Gradle
+.gradle/
+build/
+!**/src/**/build/
+out/
+
+# IntelliJ / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+captures/
+.navigation/
+
+# Local config
+local.properties
+**/local.properties
+keystore.properties
+*.jks
+*.keystore
+*.p12
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+*.apk
+*.aab
+*.ap_
+*.dex
+release/
+debug/
+
+# NDK / Native
+.cxx/
+
+# KSP / kapt
+.kotlin/
+
+# Logs
+*.log
+logs/
+
+# Temp
+*.tmp
+*.bak
+.libbox-inspect/
+.libbox-inspect.zip
