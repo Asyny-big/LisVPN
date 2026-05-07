@@ -13,4 +13,5 @@ dependencies {
     api(libs.kotlinx.datetime)
     api(libs.timber)
     implementation(libs.androidx.core.ktx)
+    implementation(libs.tink.android)
 }

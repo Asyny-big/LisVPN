@@ -68,6 +68,7 @@ class LisPlatformInterface(
         val builder = service.Builder().apply {
             setSession(SESSION_NAME)
             setMtu(TUN_MTU)
+            Timber.i("openTun config: mode=%s packages=%d", appRules.mode, appRules.packages.size)
 
             addAddress(TUN_IPV4_ADDRESS, TUN_IPV4_PREFIX)
 

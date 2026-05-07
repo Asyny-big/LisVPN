@@ -1,6 +1,8 @@
 package com.lisvpn.android.feature.home
 
 import com.lisvpn.android.core.designsystem.component.StatusOrbState
+import com.lisvpn.android.core.domain.model.Outbound
+import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.VpnState
 
 /**
@@ -17,6 +19,9 @@ data class HomeUiState(
     val errorMessage: String?,
     val activeProfileName: String?,
     val activeServerCount: Int,
+    val connectionMode: HomeConnectionMode,
+    val servers: List<HomeServerOption>,
+    val statusMessage: String? = null,
 ) {
     companion object {
         val Empty = HomeUiState(
@@ -29,39 +34,67 @@ data class HomeUiState(
             errorMessage = null,
             activeProfileName = null,
             activeServerCount = 0,
+            connectionMode = HomeConnectionMode.Auto,
+            servers = emptyList(),
+            statusMessage = null,
         )
 
-        fun from(vpn: VpnState, profileName: String?, serverCount: Int): HomeUiState = when (vpn) {
-            VpnState.Idle -> Empty.copy(
-                title = if (profileName != null) "Готов к подключению" else "Импортируйте подписку",
-                subtitle = profileName?.let { "$it · серверов: $serverCount" } ?: "Чтобы начать пользоваться LisVPN",
-                canConnect = profileName != null,
-                showImportPrompt = profileName == null,
+        fun from(
+            vpn: VpnState,
+            profileName: String?,
+            allServers: List<Server>,
+            connectionMode: HomeConnectionMode,
+            selectedServerId: String?,
+        ): HomeUiState {
+            val selected = allServers.firstOrNull { it.id == selectedServerId } ?: allServers.firstOrNull()
+            val hasServers = allServers.isNotEmpty()
+            val base = Empty.copy(
                 activeProfileName = profileName,
-                activeServerCount = serverCount,
+                activeServerCount = allServers.size,
+                connectionMode = connectionMode,
+                servers = allServers.map { server ->
+                    HomeServerOption(
+                        id = server.id,
+                        title = server.displayName,
+                        subtitle = server.uiSubtitle(),
+                        selected = server.id == selected?.id,
+                    )
+                },
             )
-            VpnState.Disconnecting -> Empty.copy(
+            return when (vpn) {
+            VpnState.Idle -> base.copy(
+                title = if (hasServers) "Готов к подключению" else "Импортируйте подписку",
+                subtitle = when {
+                    !hasServers -> "Чтобы начать пользоваться LisVPN"
+                    connectionMode == HomeConnectionMode.Auto -> "Авто · лучший из ${allServers.size}"
+                    selected != null -> "Вручную · ${selected.displayName}"
+                    else -> "Выберите сервер"
+                },
+                canConnect = hasServers,
+                showImportPrompt = !hasServers,
+            )
+            VpnState.Disconnecting -> base.copy(
                 orb = StatusOrbState.Connecting,
                 title = "Отключение…",
                 subtitle = "Закрываем VPN-туннель",
                 canConnect = false,
                 canDisconnect = false,
             )
-            VpnState.Preparing -> Empty.copy(
+            VpnState.Preparing -> base.copy(
                 orb = StatusOrbState.Connecting,
                 title = "Запрос разрешения…",
                 subtitle = "Разрешите VPN-подключение",
                 canConnect = false,
                 canDisconnect = false,
             )
-            is VpnState.Connecting -> Empty.copy(
+            is VpnState.Connecting -> base.copy(
                 orb = StatusOrbState.Connecting,
                 title = "Подключение…",
                 subtitle = vpn.serverDisplayName ?: "Поиск лучшего маршрута",
                 canConnect = false,
                 canDisconnect = true,
             )
-            is VpnState.Connected -> Empty.copy(
+            is VpnState.Connected -> base.copy(
                 orb = StatusOrbState.Connected,
                 title = "VPN включён",
                 subtitle = buildString {
@@ -71,25 +104,45 @@ data class HomeUiState(
                 canConnect = false,
                 canDisconnect = true,
             )
-            is VpnState.Reconnecting -> Empty.copy(
+            is VpnState.Reconnecting -> base.copy(
                 orb = StatusOrbState.Connecting,
                 title = "Переподключение",
                 subtitle = vpn.previousServerDisplayName ?: "Восстанавливаем туннель",
                 canConnect = false,
                 canDisconnect = true,
             )
-            is VpnState.Error -> Empty.copy(
+            is VpnState.Error -> base.copy(
                 orb = StatusOrbState.Error,
                 title = "Не удалось подключиться",
                 subtitle = vpn.detail ?: vpn.reason.toLocalizedReason(),
-                canConnect = profileName != null,
+                canConnect = hasServers,
                 canDisconnect = false,
                 errorMessage = vpn.detail,
-                activeProfileName = profileName,
-                activeServerCount = serverCount,
             )
+            }
         }
     }
+}
+
+enum class HomeConnectionMode { Auto, Manual }
+
+data class HomeServerOption(
+    val id: String,
+    val title: String,
+    val subtitle: String,
+    val selected: Boolean,
+)
+
+private fun Server.uiSubtitle(): String = listOfNotNull(
+    countryCode?.uppercase(),
+    outbound.protocolLabel(),
+).joinToString(" · ")
+
+private fun Outbound.protocolLabel(): String = when (this) {
+    is Outbound.Vless -> "VLESS"
+    is Outbound.Vmess -> "VMess"
+    is Outbound.Trojan -> "Trojan"
+    is Outbound.Shadowsocks -> "Shadowsocks"
 }
 
 private fun VpnState.Reason.toLocalizedReason(): String = when (this) {

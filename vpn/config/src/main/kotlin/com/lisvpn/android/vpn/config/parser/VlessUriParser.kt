@@ -32,26 +32,32 @@ class VlessUriParser @Inject constructor() : UriParser {
             ?: return ParseResult.Failed(rawUri, "missing port")
 
         val params = parsed.queryParameterNames.associateWith { parsed.getQueryParameter(it).orEmpty() }
-        val securityType = params["security"]?.lowercase().orEmpty()
+        val securityType = params["security"]?.trim()?.lowercase().orEmpty()
+        val transportType = normalizeTransportType(params["type"])
+            ?: return ParseResult.Failed(rawUri, "unsupported VLESS transport: ${params["type"]}")
 
-        val transport = parseTransport(params, host)
+        val transport = parseTransport(transportType, params, host)
         val security: Security = when (securityType) {
             "reality" -> {
                 val publicKey = params["pbk"].orEmpty()
                 if (publicKey.isBlank()) return ParseResult.Failed(rawUri, "missing reality public key")
                 Security.Reality(
-                    sni = params["sni"].orEmpty().ifBlank { host },
+                    sni = params["sni"].takeIf { !it.isNullOrBlank() }
+                        ?: params["host"].takeIf { !it.isNullOrBlank() }
+                        ?: host,
                     publicKey = publicKey,
                     shortId = params["sid"].takeIf { !it.isNullOrBlank() },
-                    fingerprint = params["fp"].takeIf { !it.isNullOrBlank() },
+                    fingerprint = normalizeFingerprint(params["fp"]),
                     spiderX = params["spx"].takeIf { !it.isNullOrBlank() },
                 )
             }
             "tls" -> Security.Tls(
-                sni = params["sni"].takeIf { !it.isNullOrBlank() } ?: host,
+                sni = params["sni"].takeIf { !it.isNullOrBlank() }
+                    ?: params["host"].takeIf { !it.isNullOrBlank() }
+                    ?: host,
                 alpn = params["alpn"].orEmpty().split(',').filter { it.isNotBlank() },
-                fingerprint = params["fp"].takeIf { !it.isNullOrBlank() },
-                allowInsecure = params["allowInsecure"] == "1",
+                fingerprint = normalizeFingerprint(params["fp"]),
+                allowInsecure = params["allowInsecure"] == "1" || params["insecure"] == "1",
             )
             else -> Security.None
         }
@@ -71,9 +77,19 @@ class VlessUriParser @Inject constructor() : UriParser {
         return ParseResult.Ok(outbound = outbound, displayName = display, rawUri = rawUri)
     }
 
-    private fun parseTransport(params: Map<String, String>, host: String): Transport =
-        when (params["type"]?.lowercase()) {
-            "tcp", null, "" -> Transport.Tcp
+    private fun normalizeTransportType(value: String?): String? =
+        when (value?.trim()?.lowercase()) {
+            null, "", "tcp", "raw" -> "tcp"
+            "ws" -> "ws"
+            "grpc" -> "grpc"
+            "httpupgrade" -> "httpupgrade"
+            "http" -> "http"
+            else -> null
+        }
+
+    private fun parseTransport(type: String, params: Map<String, String>, host: String): Transport =
+        when (type) {
+            "tcp" -> Transport.Tcp
             "ws" -> Transport.WebSocket(
                 path = params["path"].takeIf { !it.isNullOrBlank() },
                 host = params["host"].takeIf { !it.isNullOrBlank() } ?: host,
@@ -83,11 +99,21 @@ class VlessUriParser @Inject constructor() : UriParser {
                 path = params["path"].takeIf { !it.isNullOrBlank() },
                 host = params["host"].takeIf { !it.isNullOrBlank() } ?: host,
             )
-            "xhttp" -> Transport.XHttp(
+            "http" -> Transport.XHttp(
                 path = params["path"].takeIf { !it.isNullOrBlank() },
                 host = params["host"].takeIf { !it.isNullOrBlank() } ?: host,
                 mode = params["mode"].takeIf { !it.isNullOrBlank() },
             )
-            else -> Transport.Tcp // unknown -> safe default
+            else -> Transport.Tcp
         }
+
+    private fun normalizeFingerprint(value: String?): String? {
+        val normalized = value?.trim()?.lowercase()?.takeIf { it.isNotBlank() } ?: return null
+        return when (normalized) {
+            "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk" -> "chrome"
+            "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android", "random", "randomized" -> normalized
+            "none", "off", "false" -> null
+            else -> "chrome"
+        }
+    }
 }

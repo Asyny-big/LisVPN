@@ -14,10 +14,9 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
-import kotlinx.coroutines.flow.flatMapLatest
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.CancellationException
 import timber.log.Timber
 
 @HiltViewModel
@@ -29,12 +28,21 @@ class HomeViewModel @Inject constructor(
 ) : ViewModel() {
 
     private val activeProfile = profileRepository.observePrimaryProfile()
-    private val activeServers = activeProfile.flatMapLatest { profile ->
-        profile?.let { profileRepository.observeServers(it.id) } ?: flowOf(emptyList())
-    }
+    private val allServers = profileRepository.observeAllServers()
+    private val connectionMode = MutableStateFlow(HomeConnectionMode.Auto)
+    private val selectedServerId = MutableStateFlow<String?>(null)
+    private val _statusMessage = MutableStateFlow<String?>(null)
 
-    val uiState: StateFlow<HomeUiState> = combine(observeVpnState(), activeProfile, activeServers) { vpn, profile, servers ->
-        HomeUiState.from(vpn, profile?.name, servers.size)
+    val uiState: StateFlow<HomeUiState> = combine(
+        observeVpnState(),
+        activeProfile,
+        allServers,
+        connectionMode,
+        selectedServerId,
+    ) { vpn, profile, servers, mode, selectedId ->
+        HomeUiState.from(vpn, profile?.name, servers, mode, selectedId)
+    }.combine(_statusMessage) { state, msg ->
+        state.copy(statusMessage = msg)
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STATE_TIMEOUT_MS),
@@ -48,11 +56,31 @@ class HomeViewModel @Inject constructor(
         if (_isBusy.value) return
         viewModelScope.launch {
             _isBusy.value = true
-            when (val result = connectVpn(permission)) {
-                is AppResult.Success -> Timber.d("connect dispatched")
-                is AppResult.Failure -> Timber.w("connect failed: %s", result.error)
+            try {
+                val mode = connectionMode.value
+                _statusMessage.value = if (mode == HomeConnectionMode.Auto) {
+                    "Проверяем серверы, выбираем лучший…"
+                } else {
+                    "Проверяем сервер…"
+                }
+                when (
+                    val result = connectVpn(
+                        permission = permission,
+                        smartSelection = mode == HomeConnectionMode.Auto,
+                        selectedServerId = selectedServerId.value.takeIf { mode == HomeConnectionMode.Manual },
+                    )
+                ) {
+                    is AppResult.Success -> Timber.d("connect dispatched")
+                    is AppResult.Failure -> Timber.w("connect failed: %s", result.error)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Timber.e(e, "connect crashed")
+            } finally {
+                _statusMessage.value = null
+                _isBusy.value = false
             }
-            _isBusy.value = false
         }
     }
 
@@ -63,6 +91,15 @@ class HomeViewModel @Inject constructor(
             disconnectVpn()
             _isBusy.value = false
         }
+    }
+
+    fun onConnectionModeSelected(mode: HomeConnectionMode) {
+        connectionMode.value = mode
+    }
+
+    fun onServerSelected(serverId: String) {
+        selectedServerId.value = serverId
+        connectionMode.value = HomeConnectionMode.Manual
     }
 
     private companion object {

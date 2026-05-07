@@ -56,7 +56,13 @@ class VpnConnectionController @Inject constructor(
         val displayName = servers.firstOrNull()?.displayName
 
         _state.value = VpnState.Connecting(serverDisplayName = displayName)
-        Timber.i("VPN start requested: servers=%d smart=%s configBytes=%d", servers.size, smartSelection, configJson.length)
+        Timber.i(
+            "VPN start requested: servers=%d smart=%s configBytes=%d candidates=%s",
+            servers.size,
+            smartSelection,
+            configJson.length,
+            servers.joinToString { it.diagnosticLabel() },
+        )
 
         runCatching {
             val intent = Intent(context, LisVpnService::class.java).apply {
@@ -132,4 +138,7 @@ class VpnConnectionController @Inject constructor(
     }
 
     fun preparePermissionIntent(): Intent? = VpnService.prepare(context)
+
+    private fun Server.diagnosticLabel(): String =
+        "$displayName/${outbound.protocol}/${outbound.host}:${outbound.port}"
 }

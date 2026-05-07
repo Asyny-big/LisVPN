@@ -1,5 +1,6 @@
 package com.lisvpn.android.core.data.repository
 
+import com.lisvpn.android.core.common.security.SecretBox
 import com.lisvpn.android.core.database.entity.ProfileEntity
 import com.lisvpn.android.core.database.entity.ServerEntity
 import com.lisvpn.android.core.domain.model.Outbound
@@ -34,24 +35,33 @@ internal fun ProfileEntity.toDomain(): Profile = Profile(
     isPrimary = isPrimary,
 )
 
-internal fun ServerEntity.toDomain(): Server = Server(
+/**
+ * Reads a [ServerEntity] row, transparently decrypting the sensitive columns written by newer
+ * app versions while still accepting legacy plaintext rows produced before the SecretBox
+ * migration (see [SecretBox.tryDecrypt]).
+ */
+internal fun ServerEntity.toDomain(secretBox: SecretBox): Server = Server(
     id = id,
     profileId = profileId,
     displayName = displayName,
     countryCode = countryCode,
-    outbound = OutboundJson.decode(outboundJson),
-    rawUri = rawUri,
+    outbound = OutboundJson.decode(secretBox.tryDecrypt(outboundJson)),
+    rawUri = secretBox.tryDecrypt(rawUri),
     tags = tagsCsv.split(',').mapNotNull { value -> value.takeIf { it.isNotBlank() }?.let { Server.Tag.valueOf(it) } }.toSet(),
     createdAt = Instant.fromEpochMilliseconds(createdAtMs),
 )
 
-internal fun Server.toEntity(): ServerEntity = ServerEntity(
+/**
+ * Serialises a domain [Server] into a [ServerEntity] row. The outbound JSON (uuid, password,
+ * reality public key, ...) and the raw VLESS URI are encrypted at rest via [SecretBox].
+ */
+internal fun Server.toEntity(secretBox: SecretBox): ServerEntity = ServerEntity(
     id = id,
     profileId = profileId,
     displayName = displayName,
     countryCode = countryCode,
-    outboundJson = OutboundJson.encode(outbound),
-    rawUri = rawUri,
+    outboundJson = secretBox.encrypt(OutboundJson.encode(outbound)),
+    rawUri = secretBox.encrypt(rawUri),
     tagsCsv = tags.joinToString(",") { it.name },
     createdAtMs = createdAt.toEpochMilliseconds(),
 )

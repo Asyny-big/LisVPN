@@ -47,6 +47,8 @@ private fun HomeRoute(
             if (state.canDisconnect) viewModel.onDisconnectClick()
             else if (state.canConnect) viewModel.onConnectClick(permissionHandle)
         },
+        onConnectionModeSelected = viewModel::onConnectionModeSelected,
+        onServerSelected = viewModel::onServerSelected,
         onNavigateToServers = onNavigateToServers,
         onNavigateToSettings = onNavigateToSettings,
         onNavigateToProfiles = if (state.showImportPrompt) onNavigateToImport else onNavigateToProfiles,

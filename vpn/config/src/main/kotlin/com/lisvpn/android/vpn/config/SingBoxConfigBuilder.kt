@@ -15,7 +15,6 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
-import kotlinx.serialization.json.putJsonObject
 import timber.log.Timber
 
 /**
@@ -56,14 +55,20 @@ class SingBoxConfigBuilder @Inject constructor() {
             smartSelection && servers.size > 1 -> AUTO_TAG
             else -> outboundTags.first()
         }
-        Timber.i("Building sing-box config: servers=%d smart=%s final=%s", servers.size, smartSelection, finalTag)
+        Timber.i(
+            "Building sing-box config: servers=%d smart=%s final=%s outbounds=%s",
+            servers.size,
+            smartSelection,
+            finalTag,
+            servers.joinToString { it.diagnosticLabel() },
+        )
 
         val root = buildJsonObject {
             put("log", buildJsonObject {
                 put("level", "warn")
                 put("timestamp", true)
             })
-            put("dns", buildDns(finalTag))
+            put("dns", buildDns(finalTag, servers, smartSelection && servers.size > 1))
             putJsonArray("inbounds") { add(buildTunInbound()) }
             putJsonArray("outbounds") {
                 add(directOutbound())
@@ -137,6 +142,7 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("security", out.cipher.ifBlank { "auto" })
         encodeTls(this, out.security, defaultSni = out.host)
         encodeTransport(this, out.transport, defaultHost = out.host)
+        put("domain_strategy", "ipv4_only")
     }
 
     private fun buildTrojanOutbound(out: Outbound.Trojan, tag: String): JsonObject = buildJsonObject {
@@ -147,6 +153,7 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("password", out.password)
         encodeTls(this, out.security, defaultSni = out.host)
         encodeTransport(this, out.transport, defaultHost = out.host)
+        put("domain_strategy", "ipv4_only")
     }
 
     private fun buildShadowsocksOutbound(out: Outbound.Shadowsocks, tag: String): JsonObject = buildJsonObject {
@@ -156,6 +163,7 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("server_port", out.port)
         put("method", out.method)
         put("password", out.password)
+        put("domain_strategy", "ipv4_only")
     }
 
     private fun buildUrltestOutbound(outboundTags: List<String>): JsonObject = buildJsonObject {
@@ -230,7 +238,6 @@ class SingBoxConfigBuilder @Inject constructor() {
                 put("type", "http")
                 transport.path?.let { put("path", it) }
                 put("host", buildJsonArray { add(transport.host ?: defaultHost) })
-                transport.mode?.let { put("method", it) }
             })
         }
     }
@@ -271,33 +278,74 @@ class SingBoxConfigBuilder @Inject constructor() {
         }
     }
 
-    private fun buildDns(finalTag: String): JsonObject = buildJsonObject {
+    private fun buildDns(finalTag: String, servers: List<Server>, includeUrltestDomain: Boolean): JsonObject = buildJsonObject {
+        val localDomains = (
+            servers.mapNotNull { it.dnsRuleDomain() } +
+                listOfNotNull(URLTEST_DOMAIN.takeIf { includeUrltestDomain })
+            ).distinct()
+        Timber.i(
+            "Building sing-box DNS: final=%s localDomains=%s remote=%s address=%s local=%s",
+            finalTag,
+            localDomains.joinToString(),
+            REMOTE_DNS_TAG,
+            REMOTE_DNS_ADDRESS,
+            LOCAL_DNS_TAG,
+        )
         putJsonArray("servers") {
             addJsonObject {
-                put("tag", "remote")
-                put("address", "https://1.1.1.1/dns-query")
+                put("tag", REMOTE_DNS_TAG)
+                put("address", REMOTE_DNS_ADDRESS)
                 put("detour", finalTag)
                 put("strategy", "ipv4_only")
             }
             addJsonObject {
-                put("tag", "local")
+                put("tag", LOCAL_DNS_TAG)
                 put("address", "local")
                 put("detour", DIRECT_TAG)
             }
             addJsonObject {
-                put("tag", "block")
+                put("tag", BLOCK_DNS_TAG)
                 put("address", "rcode://success")
             }
         }
-        put("final", "remote")
+        if (localDomains.isNotEmpty()) {
+            putJsonArray("rules") {
+                addJsonObject {
+                    putJsonArray("domain") { localDomains.forEach { add(it) } }
+                    put("server", LOCAL_DNS_TAG)
+                }
+            }
+        }
+        put("final", REMOTE_DNS_TAG)
         put("strategy", "ipv4_only")
         put("disable_cache", false)
     }
+
+    private fun Server.dnsRuleDomain(): String? {
+        val host = outbound.hostName().trim().removeSuffix(".")
+        if (host.contains(':')) return null
+        return host.takeIf { value -> value.any { it.isLetter() } }
+    }
+
+    private fun Outbound.hostName(): String = when (this) {
+        is Outbound.Vless -> host
+        is Outbound.Vmess -> host
+        is Outbound.Trojan -> host
+        is Outbound.Shadowsocks -> host
+    }
+
+    private fun Server.diagnosticLabel(): String =
+        "$displayName/${outbound.protocol}/${outbound.host}:${outbound.port}"
 
     private companion object {
         const val DIRECT_TAG = "direct"
         const val BLOCK_TAG = "block"
         const val DNS_TAG = "dns-out"
         const val AUTO_TAG = "auto"
+        const val REMOTE_DNS_TAG = "remote"
+        const val REMOTE_DNS_ADDRESS = "tcp://1.1.1.1"
+        const val LOCAL_DNS_TAG = "local"
+        const val BLOCK_DNS_TAG = "block"
+        const val URLTEST_DOMAIN = "www.gstatic.com"
     }
 }

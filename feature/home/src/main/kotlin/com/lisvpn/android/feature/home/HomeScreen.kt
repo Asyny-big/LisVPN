@@ -1,32 +1,43 @@
 package com.lisvpn.android.feature.home
 
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Public
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lisvpn.android.core.designsystem.component.LisInfoLine
 import com.lisvpn.android.core.designsystem.component.LisPrimaryButton
@@ -49,6 +60,8 @@ fun HomeScreen(
     state: HomeUiState,
     isBusy: Boolean,
     onPrimaryAction: () -> Unit,
+    onConnectionModeSelected: (HomeConnectionMode) -> Unit,
+    onServerSelected: (String) -> Unit,
     onNavigateToServers: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onNavigateToProfiles: () -> Unit,
@@ -80,6 +93,8 @@ fun HomeScreen(
             state = state,
             isBusy = isBusy,
             onPrimaryAction = onPrimaryAction,
+            onConnectionModeSelected = onConnectionModeSelected,
+            onServerSelected = onServerSelected,
             onNavigateToProfiles = onNavigateToProfiles,
             modifier = Modifier
                 .fillMaxSize()
@@ -93,15 +108,19 @@ private fun HomeBody(
     state: HomeUiState,
     isBusy: Boolean,
     onPrimaryAction: () -> Unit,
+    onConnectionModeSelected: (HomeConnectionMode) -> Unit,
+    onServerSelected: (String) -> Unit,
     onNavigateToProfiles: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
-        modifier = modifier.padding(horizontal = 24.dp),
+        modifier = modifier
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceBetween,
+        verticalArrangement = Arrangement.spacedBy(24.dp),
     ) {
-        Spacer(Modifier.height(48.dp))
+        Spacer(Modifier.height(24.dp))
 
         Box(
             modifier = Modifier.fillMaxWidth(),
@@ -127,7 +146,7 @@ private fun HomeBody(
         }
 
         Column(
-            modifier = Modifier.fillMaxWidth().padding(bottom = 32.dp),
+            modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
             AnimatedVisibility(visible = state.showImportPrompt) {
@@ -140,19 +159,181 @@ private fun HomeBody(
                 }
             }
             AnimatedVisibility(visible = !state.showImportPrompt) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    ConnectionModeSwitch(
+                        selected = state.connectionMode,
+                        enabled = !isBusy && state.canConnect,
+                        onSelected = onConnectionModeSelected,
+                    )
                     LisPrimaryButton(
                         text = if (state.canDisconnect) "Отключить" else "Подключить",
                         onClick = onPrimaryAction,
                         enabled = state.canConnect || state.canDisconnect,
                         loading = isBusy,
                     )
-                    Spacer(Modifier.height(8.dp))
-                    androidx.compose.material3.TextButton(onClick = onNavigateToProfiles) {
+                    AnimatedVisibility(visible = state.statusMessage != null) {
+                        state.statusMessage?.let { msg ->
+                            Text(
+                                text = msg,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
+                    AnimatedVisibility(visible = state.connectionMode == HomeConnectionMode.Manual) {
+                        ManualServerPicker(
+                            servers = state.servers,
+                            enabled = !isBusy && state.canConnect,
+                            onServerSelected = onServerSelected,
+                        )
+                    }
+                    TextButton(onClick = onNavigateToProfiles) {
                         Text("Профили")
                     }
                 }
             }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun ConnectionModeSwitch(
+    selected: HomeConnectionMode,
+    enabled: Boolean,
+    onSelected: (HomeConnectionMode) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        ModePill(
+            title = "Авто",
+            subtitle = "Лучший сервер",
+            selected = selected == HomeConnectionMode.Auto,
+            enabled = enabled,
+            onClick = { onSelected(HomeConnectionMode.Auto) },
+        )
+        ModePill(
+            title = "Вручную",
+            subtitle = "Выбор сервера",
+            selected = selected == HomeConnectionMode.Manual,
+            enabled = enabled,
+            onClick = { onSelected(HomeConnectionMode.Manual) },
+        )
+    }
+}
+
+@Composable
+private fun RowScope.ModePill(
+    title: String,
+    subtitle: String,
+    selected: Boolean,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        modifier = Modifier
+            .weight(1f)
+            .clickable(enabled = enabled && !selected, onClick = onClick),
+        shape = RoundedCornerShape(18.dp),
+        color = if (selected) colors.primaryContainer else colors.surfaceVariant,
+        contentColor = if (selected) colors.onPrimaryContainer else colors.onSurfaceVariant,
+        border = if (selected) BorderStroke(1.dp, colors.primary) else null,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, textAlign = TextAlign.Center)
+        }
+    }
+}
+
+@Composable
+private fun ManualServerPicker(
+    servers: List<HomeServerOption>,
+    enabled: Boolean,
+    onServerSelected: (String) -> Unit,
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Text(
+            text = "Выберите сервер",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        servers.forEach { server ->
+            ManualServerCard(
+                server = server,
+                enabled = enabled,
+                onClick = { onServerSelected(server.id) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ManualServerCard(
+    server: HomeServerOption,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (server.selected) {
+                MaterialTheme.colorScheme.primaryContainer
+            } else {
+                MaterialTheme.colorScheme.surface
+            },
+        ),
+        border = if (server.selected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = server.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (server.subtitle.isNotBlank()) {
+                    Text(
+                        text = server.subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            RadioButton(
+                selected = server.selected,
+                onClick = if (enabled) onClick else null,
+                enabled = enabled,
+            )
         }
     }
 }

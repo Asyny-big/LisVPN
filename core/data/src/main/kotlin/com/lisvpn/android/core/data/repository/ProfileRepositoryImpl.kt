@@ -5,6 +5,7 @@ import android.util.Base64
 import com.lisvpn.android.core.common.dispatchers.IoDispatcher
 import com.lisvpn.android.core.common.result.AppError
 import com.lisvpn.android.core.common.result.AppResult
+import com.lisvpn.android.core.common.security.SecretBox
 import com.lisvpn.android.core.database.dao.ProfileDao
 import com.lisvpn.android.core.database.entity.ProfileEntity
 import com.lisvpn.android.core.domain.model.Outbound
@@ -38,6 +39,7 @@ class ProfileRepositoryImpl @Inject constructor(
     @LisHttpClient private val httpClient: HttpClient,
     private val subscriptionDecoder: SubscriptionDecoder,
     private val uriParserRegistry: UriParserRegistry,
+    private val secretBox: SecretBox,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
 ) : ProfileRepository {
 
@@ -45,10 +47,10 @@ class ProfileRepositoryImpl @Inject constructor(
         profileDao.observeProfiles().map { list -> list.map { it.toDomain() } }
 
     override fun observeServers(profileId: String): Flow<List<Server>> =
-        profileDao.observeServers(profileId).map { list -> list.map { it.toDomain() } }
+        profileDao.observeServers(profileId).map { list -> list.map { it.toDomain(secretBox) } }
 
     override fun observeAllServers(): Flow<List<Server>> =
-        profileDao.observeAllServers().map { list -> list.map { it.toDomain() } }
+        profileDao.observeAllServers().map { list -> list.map { it.toDomain(secretBox) } }
 
     override fun observePrimaryProfile(): Flow<Profile?> =
         profileDao.observePrimaryProfile().map { it?.toDomain() }
@@ -114,7 +116,7 @@ class ProfileRepositoryImpl @Inject constructor(
             lastRefreshedAtMs = now.toEpochMilliseconds(),
             isPrimary = existing?.isPrimary == true,
         )
-        profileDao.importProfile(entity, parsed.servers.map { it.toEntity() }, shouldBePrimary)
+        profileDao.importProfile(entity, parsed.servers.map { it.toEntity(secretBox) }, shouldBePrimary)
         Timber.i("Subscription imported: profile=%s servers=%d", profileId, parsed.servers.size)
         return AppResult.Success(profileDao.getProfile(profileId)?.toDomain() ?: entity.copy(isPrimary = shouldBePrimary).toDomain())
     }
@@ -146,7 +148,7 @@ class ProfileRepositoryImpl @Inject constructor(
             lastRefreshedAtMs = now.toEpochMilliseconds(),
             isPrimary = existing?.isPrimary == true,
         )
-        profileDao.importProfile(entity, listOf(server.toEntity()), shouldBePrimary)
+        profileDao.importProfile(entity, listOf(server.toEntity(secretBox)), shouldBePrimary)
         return AppResult.Success(profileDao.getProfile(profileId)?.toDomain() ?: entity.copy(isPrimary = shouldBePrimary).toDomain())
     }
 

@@ -3,6 +3,7 @@ package com.lisvpn.android.core.domain.usecase
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.repository.ServerHealthRepository
 import javax.inject.Inject
+import timber.log.Timber
 
 /**
  * App-side ranking. Returns up to [limit] best-scored servers; sing-box `urltest` outbound performs
@@ -17,11 +18,12 @@ class SelectBestServerUseCase @Inject constructor(
     suspend operator fun invoke(servers: List<Server>, limit: Int): List<Server> {
         if (servers.isEmpty()) return emptyList()
         val ranked = healthRepository.rank(servers, limit)
-        if (ranked.isNotEmpty()) return ranked
-
-        // Fallback: prioritise primary-tagged servers.
-        return servers
-            .sortedByDescending { Server.Tag.Primary in it.tags }
-            .take(limit)
+        Timber.i(
+            "Auto server selection result: requested=%d reachable=%d selected=%s",
+            servers.size,
+            ranked.size,
+            ranked.joinToString { it.displayName },
+        )
+        return ranked
     }
 }

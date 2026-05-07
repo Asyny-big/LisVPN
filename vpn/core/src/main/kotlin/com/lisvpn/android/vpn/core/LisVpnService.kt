@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -84,23 +85,17 @@ class LisVpnService : VpnService() {
 
         promoteForeground(VpnState.Connecting(serverLabel))
 
-        startJob?.cancel()
+        val previousStartJob = startJob
+        previousStartJob?.cancel()
         startJob = serviceScope?.launch {
+            previousStartJob?.cancelAndJoin()
+            resetRuntime()
             if (!hasUsableNetwork()) {
                 Timber.w("VPN start aborted: no usable non-VPN network")
                 controller.publishError(VpnState.Reason.NetworkUnavailable, "No validated network")
                 stopSelfCleanly()
                 return@launch
             }
-            unregisterNetworkCallback()
-            bridge?.stop()
-            bridge = null
-            activeServer = null
-            connectedAt = null
-            reconnectAttempt = 0
-            reconnectWakeJob?.cancel()
-            reconnectWakeJob = null
-            sleepingForNetwork = false
             val rules = runCatching { appRulesRepository.observe().first() }.getOrDefault(AppRules.Default)
             val newBridge = LibboxBridge(service = this@LisVpnService, configJson = configJson, appRules = rules)
             bridge = newBridge
@@ -142,17 +137,12 @@ class LisVpnService : VpnService() {
 
     private fun handleStop() {
         Timber.i("LisVpnService.handleStop")
-        startJob?.cancel()
+        val stoppingStartJob = startJob
+        stoppingStartJob?.cancel()
         serviceScope?.launch {
-            unregisterNetworkCallback()
-            bridge?.stop()
-            bridge = null
-            activeServer = null
-            connectedAt = null
-            reconnectAttempt = 0
-            reconnectWakeJob?.cancel()
-            reconnectWakeJob = null
-            sleepingForNetwork = false
+            stoppingStartJob?.cancelAndJoin()
+            resetRuntime()
+            startJob = null
             controller.publishIdle()
             stopSelfCleanly()
         }
@@ -187,16 +177,12 @@ class LisVpnService : VpnService() {
     override fun onRevoke() {
         Timber.w("VpnService permission revoked by OS/user")
         controller.publishError(VpnState.Reason.PermissionRevoked)
-        startJob?.cancel()
+        val revokedStartJob = startJob
+        revokedStartJob?.cancel()
         serviceScope?.launch {
-            unregisterNetworkCallback()
-            bridge?.stop()
-            bridge = null
-            activeServer = null
-            connectedAt = null
-            reconnectWakeJob?.cancel()
-            reconnectWakeJob = null
-            sleepingForNetwork = false
+            revokedStartJob?.cancelAndJoin()
+            resetRuntime()
+            startJob = null
             stopSelfCleanly()
         }
     }
@@ -208,6 +194,7 @@ class LisVpnService : VpnService() {
         unregisterNetworkCallback()
         runCatching { kotlinx.coroutines.runBlocking { bridge?.stop() } }
         bridge = null
+        startJob = null
         serviceScope?.cancel()
         serviceScope = null
         super.onDestroy()
@@ -221,7 +208,9 @@ class LisVpnService : VpnService() {
                     if (isVpnNetwork(network)) return@launch
                     val runningBridge = bridge
                     if (runningBridge == null || !runningBridge.isRunning()) return@launch
-                    suspendForNetwork(runningBridge, "Default network lost")
+                    if (!hasUsableNetwork()) {
+                        suspendForNetwork(runningBridge, "Default network lost")
+                    }
                 }
             }
 
@@ -239,10 +228,10 @@ class LisVpnService : VpnService() {
                     if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@launch
                     val runningBridge = bridge ?: return@launch
                     if (!runningBridge.isRunning()) return@launch
-                    if (!capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
-                        suspendForNetwork(runningBridge, "Network lost INTERNET capability")
-                    } else {
+                    if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
                         scheduleNetworkWake(runningBridge)
+                    } else if (!hasUsableNetwork()) {
+                        suspendForNetwork(runningBridge, "Network lost INTERNET capability")
                     }
                 }
             }
@@ -272,6 +261,18 @@ class LisVpnService : VpnService() {
         sleepingForNetwork = false
         controller.publishConnected(server, at)
         updateNotification(VpnState.Connected(server, at))
+    }
+
+    private suspend fun resetRuntime() {
+        unregisterNetworkCallback()
+        reconnectWakeJob?.cancelAndJoin()
+        reconnectWakeJob = null
+        bridge?.stop()
+        bridge = null
+        activeServer = null
+        connectedAt = null
+        reconnectAttempt = 0
+        sleepingForNetwork = false
     }
 
     private suspend fun suspendForNetwork(runningBridge: LibboxBridge, reason: String) {
