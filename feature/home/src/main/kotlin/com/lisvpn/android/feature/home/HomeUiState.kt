@@ -46,7 +46,7 @@ data class HomeUiState(
             connectionMode: HomeConnectionMode,
             selectedServerId: String?,
         ): HomeUiState {
-            val selected = allServers.firstOrNull { it.id == selectedServerId } ?: allServers.firstOrNull()
+            val selected = allServers.firstOrNull { it.id == selectedServerId }
             val hasServers = allServers.isNotEmpty()
             val base = Empty.copy(
                 activeProfileName = profileName,

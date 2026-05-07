@@ -3,6 +3,7 @@ package com.lisvpn.android.vpn.health
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Process
 import android.os.SystemClock
 import com.lisvpn.android.core.common.dispatchers.IoDispatcher
 import com.lisvpn.android.core.domain.model.HealthSnapshot
@@ -10,40 +11,30 @@ import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Security
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.Transport
-import com.lisvpn.android.vpn.libbox.LibboxEnvironment
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.datetime.Clock
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonObjectBuilder
-import kotlinx.serialization.json.add
-import kotlinx.serialization.json.addJsonObject
-import kotlinx.serialization.json.buildJsonArray
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
-import kotlinx.serialization.json.putJsonArray
-import libbox.InterfaceUpdateListener
-import libbox.Libbox
-import libbox.NetworkInterface
-import libbox.NetworkInterfaceIterator
-import libbox.PlatformInterface
-import libbox.TunOptions
-import libbox.WIFIState
 import timber.log.Timber
-import java.net.HttpURLConnection
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Proxy
-import java.net.ServerSocket
-import java.net.URL
+import java.net.Socket
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 @Singleton
 class ProtocolProbe @Inject constructor(
@@ -51,7 +42,7 @@ class ProtocolProbe @Inject constructor(
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
 ) {
     private val mutex = Mutex()
-    private val json = Json { prettyPrint = false; encodeDefaults = false }
+    private val unsafeSslSocketFactory: SSLSocketFactory by lazy { buildUnsafeSslSocketFactory() }
 
     suspend fun probe(server: Server): ProtocolProbeResult = withContext(ioDispatcher) {
         val networkType = currentNetworkType()
@@ -75,272 +66,507 @@ class ProtocolProbe @Inject constructor(
         }
     }
 
-    private suspend fun runProbe(server: Server, networkType: HealthSnapshot.NetworkType): ProtocolProbeResult {
-        val port = allocateLoopbackPort()
-        val config = buildProbeConfig(server, port)
-        var box: libbox.BoxService? = null
-        return try {
-            LibboxEnvironment.ensureInitialized(context)
-            Libbox.setMemoryLimit(true)
-            Libbox.checkConfig(config)
-            box = Libbox.newService(config, ProbePlatformInterface)
-            box.start()
-            delay(PROXY_WARMUP_MS)
+    private fun runProbe(server: Server, networkType: HealthSnapshot.NetworkType): ProtocolProbeResult =
+        runLightweightProbe(server, networkType)
 
-            val latency = fetchThroughProxy(port, LATENCY_URL, maxBytes = 0)
-            val download = fetchThroughProxy(port, DOWNLOAD_URL, maxBytes = DOWNLOAD_LIMIT_BYTES)
-            val bytesPerSecond = if (download.elapsedMs > 0) {
-                (download.bytesRead * 1_000L) / download.elapsedMs.toLong()
-            } else {
-                download.bytesRead * 1_000L
-            }
-            val snapshot = HealthSnapshot(
-                serverId = server.id,
-                timestamp = Clock.System.now(),
-                tcpHandshakeMs = null,
-                tlsHandshakeMs = null,
-                httpRttMs = latency.elapsedMs,
-                success = download.bytesRead >= MIN_SUCCESS_BYTES,
-                networkType = networkType,
-            )
-            Timber.i(
-                "Protocol probe success: server=%s latencyMs=%d downloadBytes=%d downloadMs=%d speedKbps=%d",
-                server.displayName,
-                latency.elapsedMs,
-                download.bytesRead,
-                download.elapsedMs,
-                (bytesPerSecond * 8L / 1_000L).coerceAtLeast(1L),
-            )
-            ProtocolProbeResult(
-                snapshot = snapshot,
-                downloadedBytes = download.bytesRead,
-                downloadMs = download.elapsedMs,
-                bytesPerSecond = bytesPerSecond,
-            )
-        } finally {
-            runCatching { box?.close() }
-        }
-    }
-
-    private fun fetchThroughProxy(port: Int, url: String, maxBytes: Int): FetchResult {
-        val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress(LOOPBACK_HOST, port))
-        val connection = URL(url).openConnection(proxy) as HttpURLConnection
-        connection.connectTimeout = HTTP_CONNECT_TIMEOUT_MS
-        connection.readTimeout = HTTP_READ_TIMEOUT_MS
-        connection.instanceFollowRedirects = true
-        connection.setRequestProperty("User-Agent", USER_AGENT)
+    private fun runLightweightProbe(server: Server, networkType: HealthSnapshot.NetworkType): ProtocolProbeResult {
         val startedAt = SystemClock.elapsedRealtime()
-        return try {
-            val status = connection.responseCode
-            if (status !in 200..299) error("HTTP status $status")
-            var bytesRead = 0L
-            if (maxBytes > 0) {
-                connection.inputStream.use { input ->
-                    val buffer = ByteArray(BUFFER_SIZE)
-                    while (bytesRead < maxBytes) {
-                        val read = input.read(buffer, 0, minOf(buffer.size, maxBytes - bytesRead.toInt()))
-                        if (read == -1) break
-                        bytesRead += read.toLong()
-                    }
+        val probeId = "${server.id.hashCode().toUInt().toString(16)}-$startedAt"
+        val outbound = server.outbound
+        val security = outbound.security()
+        val transport = outbound.transport()
+        Timber.i(
+            "Protocol probe started: id=%s mode=lightweight server=%s endpoint=%s:%d protocol=%s transport=%s security=%s pid=%d",
+            probeId,
+            server.displayName,
+            outbound.host,
+            outbound.port,
+            outbound.protocol,
+            transport.diagnosticName(),
+            security.diagnosticName(),
+            Process.myPid(),
+        )
+        Timber.i("Protocol probe lifecycle: before box create skipped id=%s mode=lightweight", probeId)
+        Timber.i("Protocol probe lifecycle: after box create skipped id=%s mode=lightweight", probeId)
+        Timber.i("Protocol probe lifecycle: before box start skipped id=%s mode=lightweight", probeId)
+        Timber.i("Protocol probe lifecycle: after box start skipped id=%s mode=lightweight", probeId)
+
+        val endpoint = resolveProbeEndpoint(server)
+        if (endpoint == null) {
+            Timber.w("Protocol probe DNS failed: id=%s server=%s host=%s", probeId, server.displayName, outbound.host)
+            return buildLightweightResult(
+                server = server,
+                networkType = networkType,
+                tcp = ProbeStep(false, null, 0L, "DNS resolution failed"),
+                tls = null,
+                transportStep = null,
+                metadata = null,
+                startedAt = startedAt,
+                probeId = probeId,
+            )
+        }
+
+        Timber.i(
+            "Protocol probe TCP before connect: id=%s server=%s dial=%s:%d originalHost=%s",
+            probeId,
+            server.displayName,
+            endpoint.address.hostAddress,
+            endpoint.port,
+            endpoint.originalHost,
+        )
+        val tcp = measureTcpPreflight(endpoint)
+        Timber.i(
+            "Protocol probe TCP after connect: id=%s server=%s success=%s elapsedMs=%s reason=%s",
+            probeId,
+            server.displayName,
+            tcp.success,
+            tcp.elapsedMs,
+            tcp.reason,
+        )
+        if (!tcp.success) {
+            return buildLightweightResult(
+                server = server,
+                networkType = networkType,
+                tcp = tcp,
+                tls = null,
+                transportStep = null,
+                metadata = null,
+                startedAt = startedAt,
+                probeId = probeId,
+            )
+        }
+
+        val tls = when (security) {
+            is Security.Tls -> {
+                val serverName = tlsServerName(endpoint, outbound, security)
+                Timber.i(
+                    "Protocol probe TLS before handshake: id=%s server=%s sni=%s allowInsecure=%s",
+                    probeId,
+                    server.displayName,
+                    serverName,
+                    security.allowInsecure,
+                )
+                measureTlsPreflight(endpoint, serverName, security.allowInsecure).also { step ->
+                    Timber.i(
+                        "Protocol probe TLS after handshake: id=%s server=%s success=%s elapsedMs=%s reason=%s",
+                        probeId,
+                        server.displayName,
+                        step.success,
+                        step.elapsedMs,
+                        step.reason,
+                    )
                 }
             }
-            val elapsedMs = (SystemClock.elapsedRealtime() - startedAt).toInt().coerceAtLeast(1)
-            FetchResult(bytesRead = bytesRead, elapsedMs = elapsedMs)
-        } finally {
-            connection.disconnect()
+            else -> null
+        }
+
+        val metadata = when (security) {
+            is Security.Reality -> validateRealityMetadata(security, tcp.elapsedMs)
+            else -> null
+        }
+        if (metadata != null) {
+            Timber.i(
+                "Protocol probe Reality metadata: id=%s server=%s success=%s elapsedMs=%s reason=%s",
+                probeId,
+                server.displayName,
+                metadata.success,
+                metadata.elapsedMs,
+                metadata.reason,
+            )
+        }
+
+        val transportStep = if (transport.requiresHttpPreflight() && security !is Security.Reality) {
+            Timber.i(
+                "Protocol probe HTTP before test: id=%s server=%s transport=%s",
+                probeId,
+                server.displayName,
+                transport.diagnosticName(),
+            )
+            measureHttpTransportPreflight(endpoint, outbound, security, transport).also { step ->
+                Timber.i(
+                    "Protocol probe HTTP after test: id=%s server=%s success=%s elapsedMs=%s bytes=%d reason=%s",
+                    probeId,
+                    server.displayName,
+                    step.success,
+                    step.elapsedMs,
+                    step.bytesRead,
+                    step.reason,
+                )
+            }
+        } else {
+            Timber.i(
+                "Protocol probe HTTP skipped: id=%s server=%s transport=%s security=%s",
+                probeId,
+                server.displayName,
+                transport.diagnosticName(),
+                security.diagnosticName(),
+            )
+            null
+        }
+
+        return buildLightweightResult(
+            server = server,
+            networkType = networkType,
+            tcp = tcp,
+            tls = tls,
+            transportStep = transportStep,
+            metadata = metadata,
+            startedAt = startedAt,
+            probeId = probeId,
+        )
+    }
+
+    private fun buildLightweightResult(
+        server: Server,
+        networkType: HealthSnapshot.NetworkType,
+        tcp: ProbeStep,
+        tls: ProbeStep?,
+        transportStep: ProbeStep?,
+        metadata: ProbeStep?,
+        startedAt: Long,
+        probeId: String,
+    ): ProtocolProbeResult {
+        val outbound = server.outbound
+        val security = outbound.security()
+        val transport = outbound.transport()
+        val validationSteps = listOfNotNull(tcp, tls, metadata, transportStep)
+        val success = when {
+            !tcp.success -> false
+            transport.requiresHttpPreflight() && security !is Security.Reality -> transportStep?.success == true
+            security is Security.Tls -> tls?.success == true
+            security is Security.Reality -> metadata?.success == true
+            outbound is Outbound.Shadowsocks -> true
+            security == Security.None -> true
+            else -> false
+        }
+        val elapsedMs = elapsedSince(startedAt)
+        val bestProtocolMs = listOfNotNull(transportStep?.elapsedMs, tls?.elapsedMs, metadata?.elapsedMs, tcp.elapsedMs).minOrNull()
+        val downloadedBytes = transportStep?.bytesRead ?: 0L
+        val downloadMs = transportStep?.elapsedMs
+        val snapshot = HealthSnapshot(
+            serverId = server.id,
+            timestamp = Clock.System.now(),
+            tcpHandshakeMs = tcp.elapsedMs,
+            tlsHandshakeMs = tls?.elapsedMs?.takeIf { tls.success },
+            httpRttMs = bestProtocolMs,
+            success = success,
+            networkType = networkType,
+        )
+        Timber.i(
+            "Protocol probe completed: id=%s mode=lightweight server=%s success=%s tcpMs=%s tlsMs=%s httpMs=%s checks=%d/%d bytes=%d elapsedMs=%d",
+            probeId,
+            server.displayName,
+            success,
+            tcp.elapsedMs,
+            tls?.elapsedMs,
+            transportStep?.elapsedMs,
+            validationSteps.count { it.success },
+            validationSteps.size,
+            downloadedBytes,
+            elapsedMs,
+        )
+        Timber.i("Protocol probe lifecycle: before shutdown skipped id=%s mode=lightweight", probeId)
+        Timber.i("Protocol probe lifecycle: after shutdown skipped id=%s mode=lightweight", probeId)
+        return ProtocolProbeResult(
+            snapshot = snapshot,
+            downloadedBytes = downloadedBytes,
+            downloadMs = downloadMs,
+            bytesPerSecond = null,
+            startupMs = elapsedMs,
+            latencySamplesMs = listOfNotNull(tcp.elapsedMs, tls?.elapsedMs, transportStep?.elapsedMs),
+            internetCheckCount = validationSteps.size,
+            internetSuccessCount = validationSteps.count { it.success },
+            blockedCheckCount = 0,
+            blockedSuccessCount = 0,
+        )
+    }
+
+    private fun resolveProbeEndpoint(server: Server): ProbeEndpoint? {
+        val host = server.outbound.host.trim().removeSuffix(".")
+        if (host.isBlank() || host.contains(':')) return null
+        val address = runCatching {
+            InetAddress.getAllByName(host)
+                .filterIsInstance<Inet4Address>()
+                .firstOrNull()
+        }.getOrNull() ?: return null
+        return ProbeEndpoint(
+            originalHost = host,
+            address = address,
+            port = server.outbound.port,
+        )
+    }
+
+    private fun measureTcpPreflight(endpoint: ProbeEndpoint): ProbeStep {
+        val startedAt = SystemClock.elapsedRealtime()
+        return runCatching {
+            connectPlainSocket(endpoint).use { }
+            ProbeStep(
+                success = true,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = null,
+            )
+        }.getOrElse { err ->
+            ProbeStep(
+                success = false,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = err.protocolProbeReason(),
+            )
         }
     }
 
-    private fun buildProbeConfig(server: Server, port: Int): String {
-        val root = buildJsonObject {
-            put("log", buildJsonObject {
-                put("level", "warn")
-                put("timestamp", true)
-            })
-            put("dns", buildDns(server))
-            putJsonArray("inbounds") {
-                addJsonObject {
-                    put("type", "mixed")
-                    put("tag", INBOUND_TAG)
-                    put("listen", LOOPBACK_HOST)
-                    put("listen_port", port)
-                    put("sniff", true)
-                    put("sniff_override_destination", false)
-                }
-            }
-            putJsonArray("outbounds") {
-                addJsonObject {
-                    put("type", "direct")
-                    put("tag", DIRECT_TAG)
-                }
-                add(buildServerOutbound(server, SERVER_TAG))
-            }
-            put("route", buildJsonObject {
-                put("auto_detect_interface", true)
-                put("final", SERVER_TAG)
-            })
+    private fun measureTlsPreflight(endpoint: ProbeEndpoint, serverName: String?, allowInsecure: Boolean): ProbeStep {
+        val startedAt = SystemClock.elapsedRealtime()
+        return runCatching {
+            connectTlsSocket(endpoint, serverName, allowInsecure).use { }
+            ProbeStep(
+                success = true,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = null,
+            )
+        }.getOrElse { err ->
+            ProbeStep(
+                success = false,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = err.protocolProbeReason(),
+            )
         }
-        return json.encodeToString(JsonObject.serializer(), root)
     }
 
-    private fun buildDns(server: Server): JsonObject = buildJsonObject {
-        val serverDomain = server.dnsRuleDomain()
-        putJsonArray("servers") {
-            addJsonObject {
-                put("tag", REMOTE_DNS_TAG)
-                put("address", REMOTE_DNS_ADDRESS)
-                put("detour", SERVER_TAG)
-                put("strategy", "ipv4_only")
+    private fun validateRealityMetadata(security: Security.Reality, tcpMs: Int?): ProbeStep {
+        val success = security.sni.isNotBlank() && security.publicKey.isNotBlank()
+        return ProbeStep(
+            success = success,
+            elapsedMs = tcpMs,
+            bytesRead = 0L,
+            reason = if (success) null else "Reality metadata is incomplete",
+        )
+    }
+
+    private fun measureHttpTransportPreflight(
+        endpoint: ProbeEndpoint,
+        outbound: Outbound,
+        security: Security,
+        transport: Transport,
+    ): ProbeStep {
+        val startedAt = SystemClock.elapsedRealtime()
+        return runCatching {
+            val serverName = when (security) {
+                is Security.Tls -> tlsServerName(endpoint, outbound, security)
+                else -> null
             }
-            addJsonObject {
-                put("tag", LOCAL_DNS_TAG)
-                put("address", "local")
-                put("detour", DIRECT_TAG)
+            val hostHeader = transport.hostHeader() ?: serverName ?: endpoint.originalHost
+            val request = transport.httpRequest(transport.httpPath(), hostHeader)
+            val response = openProtocolSocket(endpoint, security, serverName).use { socket ->
+                socket.soTimeout = HTTP_READ_TIMEOUT_MS
+                val output = BufferedOutputStream(socket.getOutputStream())
+                output.write(request.toByteArray(Charsets.US_ASCII))
+                output.flush()
+                val buffer = ByteArray(HTTP_RESPONSE_LIMIT_BYTES)
+                val read = BufferedInputStream(socket.getInputStream()).read(buffer)
+                if (read <= 0) error("Empty HTTP response")
+                String(buffer, 0, read, Charsets.ISO_8859_1)
             }
+            val status = response.httpStatusCode()
+            val success = status in 100..499
+            ProbeStep(
+                success = success,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = response.length.toLong(),
+                reason = status?.let { "HTTP $it" } ?: "No HTTP status",
+            )
+        }.getOrElse { err ->
+            ProbeStep(
+                success = false,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = err.protocolProbeReason(),
+            )
         }
-        serverDomain?.let { domain ->
-            putJsonArray("rules") {
-                addJsonObject {
-                    putJsonArray("domain") { add(domain) }
-                    put("server", LOCAL_DNS_TAG)
-                }
-            }
-        }
-        put("final", REMOTE_DNS_TAG)
-        put("strategy", "ipv4_only")
-        put("disable_cache", true)
     }
 
-    private fun buildServerOutbound(server: Server, tag: String): JsonObject = when (val out = server.outbound) {
-        is Outbound.Vless -> buildVlessOutbound(out, tag)
-        is Outbound.Vmess -> buildVmessOutbound(out, tag)
-        is Outbound.Trojan -> buildTrojanOutbound(out, tag)
-        is Outbound.Shadowsocks -> buildShadowsocksOutbound(out, tag)
-    }
-
-    private fun buildVlessOutbound(out: Outbound.Vless, tag: String): JsonObject = buildJsonObject {
-        put("type", "vless")
-        put("tag", tag)
-        put("server", out.host)
-        put("server_port", out.port)
-        put("uuid", out.uuid)
-        out.flow?.let { put("flow", it) }
-        if (out.encryption.isNotBlank() && out.encryption != "none") put("packet_encoding", out.encryption)
-        encodeTls(this, out.security, defaultSni = out.host)
-        encodeTransport(this, out.transport, defaultHost = out.host)
-        put("domain_strategy", "ipv4_only")
-    }
-
-    private fun buildVmessOutbound(out: Outbound.Vmess, tag: String): JsonObject = buildJsonObject {
-        put("type", "vmess")
-        put("tag", tag)
-        put("server", out.host)
-        put("server_port", out.port)
-        put("uuid", out.uuid)
-        put("alter_id", out.alterId)
-        put("security", out.cipher.ifBlank { "auto" })
-        encodeTls(this, out.security, defaultSni = out.host)
-        encodeTransport(this, out.transport, defaultHost = out.host)
-        put("domain_strategy", "ipv4_only")
-    }
-
-    private fun buildTrojanOutbound(out: Outbound.Trojan, tag: String): JsonObject = buildJsonObject {
-        put("type", "trojan")
-        put("tag", tag)
-        put("server", out.host)
-        put("server_port", out.port)
-        put("password", out.password)
-        encodeTls(this, out.security, defaultSni = out.host)
-        encodeTransport(this, out.transport, defaultHost = out.host)
-        put("domain_strategy", "ipv4_only")
-    }
-
-    private fun buildShadowsocksOutbound(out: Outbound.Shadowsocks, tag: String): JsonObject = buildJsonObject {
-        put("type", "shadowsocks")
-        put("tag", tag)
-        put("server", out.host)
-        put("server_port", out.port)
-        put("method", out.method)
-        put("password", out.password)
-        put("domain_strategy", "ipv4_only")
-    }
-
-    private fun encodeTls(builder: JsonObjectBuilder, security: Security, defaultSni: String) {
+    private fun openProtocolSocket(endpoint: ProbeEndpoint, security: Security, serverName: String?): Socket =
         when (security) {
-            Security.None -> Unit
-            is Security.Tls -> builder.put("tls", buildJsonObject {
-                put("enabled", true)
-                put("server_name", security.sni ?: defaultSni)
-                if (security.alpn.isNotEmpty()) putJsonArray("alpn") { security.alpn.forEach { add(it) } }
-                put("utls", buildJsonObject {
-                    put("enabled", true)
-                    put("fingerprint", security.fingerprint ?: "chrome")
-                })
-                if (security.allowInsecure) put("insecure", true)
-            })
-            is Security.Reality -> builder.put("tls", buildJsonObject {
-                put("enabled", true)
-                put("server_name", security.sni)
-                put("utls", buildJsonObject {
-                    put("enabled", true)
-                    put("fingerprint", security.fingerprint ?: "chrome")
-                })
-                put("reality", buildJsonObject {
-                    put("enabled", true)
-                    put("public_key", security.publicKey)
-                    put("short_id", security.shortId.orEmpty())
-                })
-            })
+            Security.None -> connectPlainSocket(endpoint)
+            is Security.Tls -> connectTlsSocket(endpoint, serverName, security.allowInsecure)
+            is Security.Reality -> error("Reality transport requires native client")
+        }
+
+    private fun connectPlainSocket(endpoint: ProbeEndpoint): Socket {
+        val socket = Socket()
+        return try {
+            socket.tcpNoDelay = true
+            socket.soTimeout = HTTP_READ_TIMEOUT_MS
+            socket.connect(InetSocketAddress(endpoint.address, endpoint.port), TCP_CONNECT_TIMEOUT_MS)
+            socket
+        } catch (err: Throwable) {
+            runCatching { socket.close() }
+            throw err
         }
     }
 
-    private fun encodeTransport(builder: JsonObjectBuilder, transport: Transport, defaultHost: String) {
-        when (transport) {
-            Transport.Tcp -> Unit
-            is Transport.WebSocket -> builder.put("transport", buildJsonObject {
-                put("type", "ws")
-                transport.path?.let { put("path", it) }
-                put("headers", buildJsonObject {
-                    put("Host", transport.host ?: defaultHost)
-                })
-                transport.earlyDataHeader?.let { put("early_data_header_name", it) }
-            })
-            is Transport.Grpc -> builder.put("transport", buildJsonObject {
-                put("type", "grpc")
-                put("service_name", transport.serviceName)
-            })
-            is Transport.HttpUpgrade -> builder.put("transport", buildJsonObject {
-                put("type", "httpupgrade")
-                transport.path?.let { put("path", it) }
-                put("host", transport.host ?: defaultHost)
-            })
-            is Transport.XHttp -> builder.put("transport", buildJsonObject {
-                put("type", "http")
-                transport.path?.let { put("path", it) }
-                put("host", buildJsonArray { add(transport.host ?: defaultHost) })
-            })
+    private fun connectTlsSocket(endpoint: ProbeEndpoint, serverName: String?, allowInsecure: Boolean): SSLSocket {
+        var plain: Socket? = connectPlainSocket(endpoint)
+        var ssl: SSLSocket? = null
+        return try {
+            val peerHost = serverName ?: endpoint.originalHost
+            val factory = if (allowInsecure) unsafeSslSocketFactory else SSLSocketFactory.getDefault() as SSLSocketFactory
+            ssl = factory.createSocket(plain, peerHost, endpoint.port, true) as SSLSocket
+            plain = null
+            ssl.soTimeout = TLS_HANDSHAKE_TIMEOUT_MS
+            ssl.useClientMode = true
+            val parameters = ssl.sslParameters
+            if (!allowInsecure) parameters.endpointIdentificationAlgorithm = "HTTPS"
+            if (serverName != null && serverName.canBeSniHost()) {
+                parameters.serverNames = listOf(SNIHostName(serverName))
+            }
+            ssl.sslParameters = parameters
+            ssl.startHandshake()
+            ssl
+        } catch (err: Throwable) {
+            runCatching { ssl?.close() }
+            runCatching { plain?.close() }
+            throw err
         }
     }
 
-    private fun allocateLoopbackPort(): Int = ServerSocket(0, 1, InetAddress.getByName(LOOPBACK_HOST)).use { socket ->
-        socket.localPort
+    private fun buildUnsafeSslSocketFactory(): SSLSocketFactory {
+        val trustManagers = arrayOf<TrustManager>(
+            object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+                override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
+                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+            },
+        )
+        val context = SSLContext.getInstance("TLS")
+        context.init(null, trustManagers, SecureRandom())
+        return context.socketFactory
     }
 
-    private fun Server.dnsRuleDomain(): String? {
-        val host = outbound.host.trim().removeSuffix(".")
-        if (host.contains(':')) return null
-        return host.takeIf { value -> value.any { it.isLetter() } }
+    private fun tlsServerName(endpoint: ProbeEndpoint, outbound: Outbound, security: Security.Tls): String? =
+        security.sni?.takeIf { it.isNotBlank() }
+            ?: outbound.transport().hostHeader()?.takeIf { it.canBeSniHost() }
+            ?: endpoint.originalHost.takeIf { it.canBeSniHost() }
+
+    private fun Transport.httpRequest(path: String, host: String): String =
+        when (this) {
+            is Transport.WebSocket,
+            is Transport.HttpUpgrade -> buildString {
+                append("GET ")
+                append(path)
+                append(" HTTP/1.1\r\n")
+                append("Host: ")
+                append(host)
+                append("\r\n")
+                append("User-Agent: ")
+                append(USER_AGENT)
+                append("\r\n")
+                append("Connection: Upgrade\r\n")
+                append("Upgrade: websocket\r\n")
+                append("Sec-WebSocket-Version: 13\r\n")
+                append("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n")
+                append("\r\n")
+            }
+            is Transport.XHttp -> buildString {
+                append("HEAD ")
+                append(path)
+                append(" HTTP/1.1\r\n")
+                append("Host: ")
+                append(host)
+                append("\r\n")
+                append("User-Agent: ")
+                append(USER_AGENT)
+                append("\r\n")
+                append("Connection: close\r\n")
+                append("\r\n")
+            }
+            Transport.Tcp,
+            is Transport.Grpc -> error("Transport does not use HTTP preflight")
+        }
+
+    private fun Transport.httpPath(): String =
+        when (this) {
+            is Transport.WebSocket -> path
+            is Transport.HttpUpgrade -> path
+            is Transport.XHttp -> path
+            Transport.Tcp,
+            is Transport.Grpc -> null
+        }.normalizeHttpPath()
+
+    private fun String?.normalizeHttpPath(): String {
+        val value = this?.takeIf { it.isNotBlank() } ?: "/"
+        return if (value.startsWith("/")) value else "/$value"
     }
+
+    private fun String.httpStatusCode(): Int? {
+        val firstLine = lineSequence().firstOrNull().orEmpty()
+        val parts = firstLine.split(' ')
+        return parts.getOrNull(1)?.toIntOrNull()
+    }
+
+    private fun Transport.requiresHttpPreflight(): Boolean =
+        this is Transport.WebSocket || this is Transport.HttpUpgrade || this is Transport.XHttp
+
+    private fun Outbound.security(): Security = when (this) {
+        is Outbound.Vless -> security
+        is Outbound.Vmess -> security
+        is Outbound.Trojan -> security
+        is Outbound.Shadowsocks -> Security.None
+    }
+
+    private fun Outbound.transport(): Transport = when (this) {
+        is Outbound.Vless -> transport
+        is Outbound.Vmess -> transport
+        is Outbound.Trojan -> transport
+        is Outbound.Shadowsocks -> Transport.Tcp
+    }
+
+    private fun Transport.hostHeader(): String? = when (this) {
+        Transport.Tcp -> null
+        is Transport.WebSocket -> host
+        is Transport.Grpc -> null
+        is Transport.HttpUpgrade -> host
+        is Transport.XHttp -> host
+    }?.takeIf { it.isNotBlank() }
+
+    private fun Transport.diagnosticName(): String = when (this) {
+        Transport.Tcp -> "tcp"
+        is Transport.WebSocket -> "ws"
+        is Transport.Grpc -> "grpc"
+        is Transport.HttpUpgrade -> "httpupgrade"
+        is Transport.XHttp -> "xhttp"
+    }
+
+    private fun Security.diagnosticName(): String = when (this) {
+        Security.None -> "none"
+        is Security.Tls -> "tls"
+        is Security.Reality -> "reality"
+    }
+
+    private fun String.canBeSniHost(): Boolean =
+        isNotBlank() && any { it.isLetter() } && !contains(':')
+
+    private fun elapsedSince(startedAt: Long): Int =
+        (SystemClock.elapsedRealtime() - startedAt).toInt().coerceAtLeast(1)
 
     private fun currentNetworkType(): HealthSnapshot.NetworkType {
         val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = manager.activeNetwork ?: return HealthSnapshot.NetworkType.Unknown
         val caps = manager.getNetworkCapabilities(network) ?: return HealthSnapshot.NetworkType.Unknown
+        val metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        val roaming = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING)
         return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> HealthSnapshot.NetworkType.Wifi
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> HealthSnapshot.NetworkType.Cellular
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> HealthSnapshot.NetworkType.Ethernet
             caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> HealthSnapshot.NetworkType.VpnInterface
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && roaming -> HealthSnapshot.NetworkType.CellularRoaming
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && metered -> HealthSnapshot.NetworkType.CellularMetered
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> HealthSnapshot.NetworkType.Cellular
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && metered -> HealthSnapshot.NetworkType.WifiMetered
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> HealthSnapshot.NetworkType.Wifi
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> HealthSnapshot.NetworkType.Ethernet
+            metered -> HealthSnapshot.NetworkType.Metered
             else -> HealthSnapshot.NetworkType.Unknown
         }
     }
@@ -358,61 +584,25 @@ class ProtocolProbe @Inject constructor(
     private fun Throwable.protocolProbeReason(): String =
         "${this::class.java.simpleName}: ${message.orEmpty()}"
 
-    private data class FetchResult(
-        val bytesRead: Long,
-        val elapsedMs: Int,
+    private data class ProbeEndpoint(
+        val originalHost: String,
+        val address: Inet4Address,
+        val port: Int,
     )
 
-    private object ProbePlatformInterface : PlatformInterface {
-        override fun openTun(options: TunOptions): Int = error("Protocol probe config must not request TUN")
-        override fun usePlatformAutoDetectInterfaceControl(): Boolean = false
-        override fun autoDetectInterfaceControl(fd: Int) = Unit
-        override fun useProcFS(): Boolean = false
-        override fun findConnectionOwner(
-            ipProto: Int,
-            sourceAddress: String,
-            sourcePort: Int,
-            destinationAddress: String,
-            destinationPort: Int,
-        ): Int = 0
-        override fun packageNameByUid(uid: Int): String = ""
-        override fun uidByPackageName(packageName: String): Int = 0
-        override fun usePlatformDefaultInterfaceMonitor(): Boolean = false
-        override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
-        override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) = Unit
-        override fun usePlatformInterfaceGetter(): Boolean = false
-        override fun getInterfaces(): NetworkInterfaceIterator = EmptyNetworkInterfaceIterator
-        override fun underNetworkExtension(): Boolean = false
-        override fun clearDNSCache() = Unit
-        override fun readWIFIState(): WIFIState = Libbox.newWIFIState("", "")
-        override fun writeLog(message: String) {
-            Timber.tag(TAG_LIBBOX_PROBE).d(message)
-        }
-    }
-
-    private object EmptyNetworkInterfaceIterator : NetworkInterfaceIterator {
-        override fun hasNext(): Boolean = false
-        override fun next(): NetworkInterface = error("No network interfaces in probe")
-    }
+    private data class ProbeStep(
+        val success: Boolean,
+        val elapsedMs: Int?,
+        val bytesRead: Long,
+        val reason: String?,
+    )
 
     private companion object {
-        const val LOOPBACK_HOST = "127.0.0.1"
-        const val INBOUND_TAG = "probe-in"
-        const val SERVER_TAG = "probe"
-        const val DIRECT_TAG = "direct"
-        const val REMOTE_DNS_TAG = "remote"
-        const val REMOTE_DNS_ADDRESS = "tcp://1.1.1.1"
-        const val LOCAL_DNS_TAG = "local"
-        const val LATENCY_URL = "https://www.gstatic.com/generate_204"
-        const val DOWNLOAD_URL = "https://speed.cloudflare.com/__down?bytes=262144"
         const val USER_AGENT = "LisVPN/ProtocolProbe"
-        const val PROXY_WARMUP_MS = 250L
-        const val HTTP_CONNECT_TIMEOUT_MS = 6_000
-        const val HTTP_READ_TIMEOUT_MS = 10_000
-        const val DOWNLOAD_LIMIT_BYTES = 256 * 1024
-        const val MIN_SUCCESS_BYTES = 32 * 1024
-        const val BUFFER_SIZE = 16 * 1024
-        const val TAG_LIBBOX_PROBE = "libbox-probe"
+        const val TCP_CONNECT_TIMEOUT_MS = 2_500
+        const val TLS_HANDSHAKE_TIMEOUT_MS = 3_500
+        const val HTTP_READ_TIMEOUT_MS = 3_500
+        const val HTTP_RESPONSE_LIMIT_BYTES = 4 * 1024
     }
 }
 
@@ -421,4 +611,10 @@ data class ProtocolProbeResult(
     val downloadedBytes: Long,
     val downloadMs: Int?,
     val bytesPerSecond: Long?,
+    val startupMs: Int? = null,
+    val latencySamplesMs: List<Int> = emptyList(),
+    val internetCheckCount: Int = 0,
+    val internetSuccessCount: Int = 0,
+    val blockedCheckCount: Int = 0,
+    val blockedSuccessCount: Int = 0,
 )

@@ -1,8 +1,8 @@
 package com.lisvpn.android.core.data.repository
 
-import com.lisvpn.android.core.common.dispatchers.IoDispatcher
 import com.lisvpn.android.core.common.result.AppError
 import com.lisvpn.android.core.common.result.AppResult
+import com.lisvpn.android.core.common.dispatchers.IoDispatcher
 import com.lisvpn.android.core.domain.model.AppRules
 import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Security

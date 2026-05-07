@@ -72,11 +72,7 @@ class LisPlatformInterface(
 
             addAddress(TUN_IPV4_ADDRESS, TUN_IPV4_PREFIX)
 
-            addAddress(TUN_IPV6_ADDRESS, TUN_IPV6_PREFIX)
-
             addRoute("0.0.0.0", 0)
-
-            addRoute("::", 0)
 
             addDnsServer(TUN_DNS_SERVER)
 
@@ -181,8 +177,6 @@ class LisPlatformInterface(
         const val TUN_MTU = 1280
         const val TUN_IPV4_ADDRESS = "172.19.0.1"
         const val TUN_IPV4_PREFIX = 30
-        const val TUN_IPV6_ADDRESS = "fdfe:dcba:9876::1"
-        const val TUN_IPV6_PREFIX = 126
         const val TUN_DNS_SERVER = "172.19.0.2"
     }
 }

@@ -81,11 +81,17 @@ class HealthProbe @Inject constructor(
         val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = manager.activeNetwork ?: return HealthSnapshot.NetworkType.Unknown
         val caps = manager.getNetworkCapabilities(network) ?: return HealthSnapshot.NetworkType.Unknown
+        val metered = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+        val roaming = !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING)
         return when {
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> HealthSnapshot.NetworkType.Wifi
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> HealthSnapshot.NetworkType.Cellular
-            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> HealthSnapshot.NetworkType.Ethernet
             caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> HealthSnapshot.NetworkType.VpnInterface
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && roaming -> HealthSnapshot.NetworkType.CellularRoaming
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) && metered -> HealthSnapshot.NetworkType.CellularMetered
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> HealthSnapshot.NetworkType.Cellular
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) && metered -> HealthSnapshot.NetworkType.WifiMetered
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> HealthSnapshot.NetworkType.Wifi
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> HealthSnapshot.NetworkType.Ethernet
+            metered -> HealthSnapshot.NetworkType.Metered
             else -> HealthSnapshot.NetworkType.Unknown
         }
     }

@@ -47,13 +47,23 @@ class VpnConnectionController @Inject constructor(
             return Result.failure(SecurityException("VpnService permission denied"))
         }
 
+        Timber.i(
+            "VPN config assembly requested: servers=%d smart=%s candidates=%s",
+            servers.size,
+            smartSelection,
+            servers.joinToString { it.diagnosticLabel() },
+        )
         val configJson = runCatching { configAssembler.assemble(servers, smartSelection, appRules) }
             .onFailure { err ->
                 Timber.e(err, "VPN config assembly failed")
                 _state.value = VpnState.Error(VpnState.Reason.ConfigInvalid, err.message)
             }
             .getOrElse { return Result.failure(it) }
-        val displayName = servers.firstOrNull()?.displayName
+        val displayName = if (smartSelection && servers.size > 1) {
+            "Авто · ${servers.size} кандидатов"
+        } else {
+            servers.firstOrNull()?.displayName
+        }
 
         _state.value = VpnState.Connecting(serverDisplayName = displayName)
         Timber.i(

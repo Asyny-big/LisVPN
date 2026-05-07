@@ -5,6 +5,7 @@ import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Security
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.Transport
+import com.lisvpn.android.core.domain.model.normalizeVlessFlowForSingBox
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.serialization.json.Json
@@ -51,16 +52,26 @@ class SingBoxConfigBuilder @Inject constructor() {
         require(servers.isNotEmpty()) { "Cannot build sing-box config without servers" }
 
         val outboundTags = servers.indices.map { index -> "srv-$index" }
+        check(outboundTags.distinct().size == outboundTags.size) { "Generated duplicate outbound tags" }
         val finalTag = when {
             smartSelection && servers.size > 1 -> AUTO_TAG
             else -> outboundTags.first()
         }
+        check(!smartSelection || servers.size <= 1 || outboundTags.isNotEmpty()) { "Cannot build urltest without server outbounds" }
         Timber.i(
             "Building sing-box config: servers=%d smart=%s final=%s outbounds=%s",
             servers.size,
             smartSelection,
             finalTag,
             servers.joinToString { it.diagnosticLabel() },
+        )
+        Timber.i(
+            "Building sing-box selector: smart=%s includeUrltest=%s final=%s url=%s selectorOutbounds=%s",
+            smartSelection,
+            smartSelection && servers.size > 1,
+            finalTag,
+            URLTEST_URL,
+            outboundTags.joinToString(),
         )
 
         val root = buildJsonObject {
@@ -90,10 +101,9 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("type", "tun")
         put("tag", "tun-in")
         put("inet4_address", "172.19.0.1/30")
-        put("inet6_address", "fdfe:dcba:9876::1/126")
         put("mtu", 1280)
         put("auto_route", true)
-        put("strict_route", true)
+        put("strict_route", false)
         put("stack", "system")
         put("sniff", true)
         put("sniff_override_destination", false)
@@ -125,7 +135,7 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("server", out.host)
         put("server_port", out.port)
         put("uuid", out.uuid)
-        out.flow?.let { put("flow", it) }
+        normalizeVlessFlowForSingBox(out.flow)?.let { put("flow", it) }
         if (out.encryption.isNotBlank() && out.encryption != "none") put("packet_encoding", out.encryption)
         encodeTls(this, out.security, defaultSni = out.host)
         encodeTransport(this, out.transport, defaultHost = out.host)
@@ -170,9 +180,9 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("type", "urltest")
         put("tag", AUTO_TAG)
         putJsonArray("outbounds") { outboundTags.forEach { add(it) } }
-        put("url", "https://www.gstatic.com/generate_204")
+        put("url", URLTEST_URL)
         put("interval", "10m")
-        put("tolerance", 100)
+        put("tolerance", 50)
     }
 
     private fun encodeTls(
@@ -270,8 +280,6 @@ class SingBoxConfigBuilder @Inject constructor() {
                     add("172.16.0.0/12")
                     add("192.168.0.0/16")
                     add("169.254.0.0/16")
-                    add("fc00::/7")
-                    add("fe80::/10")
                 }
                 put("outbound", DIRECT_TAG)
             }
@@ -295,13 +303,14 @@ class SingBoxConfigBuilder @Inject constructor() {
             addJsonObject {
                 put("tag", REMOTE_DNS_TAG)
                 put("address", REMOTE_DNS_ADDRESS)
-                put("detour", finalTag)
+                put("detour", DIRECT_TAG)
                 put("strategy", "ipv4_only")
             }
             addJsonObject {
                 put("tag", LOCAL_DNS_TAG)
                 put("address", "local")
                 put("detour", DIRECT_TAG)
+                put("strategy", "ipv4_only")
             }
             addJsonObject {
                 put("tag", BLOCK_DNS_TAG)
@@ -343,9 +352,10 @@ class SingBoxConfigBuilder @Inject constructor() {
         const val DNS_TAG = "dns-out"
         const val AUTO_TAG = "auto"
         const val REMOTE_DNS_TAG = "remote"
-        const val REMOTE_DNS_ADDRESS = "tcp://1.1.1.1"
+        const val REMOTE_DNS_ADDRESS = "https://1.1.1.1/dns-query"
         const val LOCAL_DNS_TAG = "local"
         const val BLOCK_DNS_TAG = "block"
         const val URLTEST_DOMAIN = "www.gstatic.com"
+        const val URLTEST_URL = "https://www.gstatic.com/generate_204"
     }
 }

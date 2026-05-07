@@ -14,7 +14,7 @@ data class HealthSnapshot(
     val success: Boolean,
     val networkType: NetworkType,
 ) {
-    enum class NetworkType { Wifi, Cellular, Ethernet, VpnInterface, Unknown }
+    enum class NetworkType { Wifi, WifiMetered, Cellular, CellularMetered, CellularRoaming, Ethernet, Metered, VpnInterface, Unknown }
 }
 
 /** Aggregated rolling score over a window of [HealthSnapshot]s. */

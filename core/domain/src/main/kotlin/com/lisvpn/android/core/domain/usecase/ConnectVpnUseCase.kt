@@ -6,6 +6,7 @@ import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Security
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.Transport
+import com.lisvpn.android.core.domain.model.isVlessFlowSupportedByCurrentLibbox
 import com.lisvpn.android.core.domain.repository.ServerHealthRepository
 import com.lisvpn.android.core.domain.repository.ProfileRepository
 import com.lisvpn.android.core.domain.repository.VpnPermissionHandle
@@ -36,17 +37,26 @@ class ConnectVpnUseCase @Inject constructor(
 
         val selected = if (smartSelection) {
             val compatible = servers.filter { it.isSupportedByCurrentLibbox() }
+            Timber.i(
+                "Auto connect pipeline: before scoring available=%d compatible=%d",
+                servers.size,
+                compatible.size,
+            )
             if (compatible.isEmpty()) {
                 return AppResult.Failure(AppError.Vpn("No sing-box compatible VPN servers in subscription"))
             }
-            selectBestServer(compatible, limit = SMART_LIMIT)
+            val ranked = selectBestServer(compatible, limit = SMART_LIMIT)
+            Timber.i(
+                "Auto connect pipeline: after scoring selectedCount=%d selected=%s",
+                ranked.size,
+                ranked.joinToString { it.displayName },
+            )
+            ranked
         } else {
-            val server = if (selectedServerId == null) {
-                servers.first()
-            } else {
-                servers.firstOrNull { it.id == selectedServerId }
-                    ?: return AppResult.Failure(AppError.Vpn("Selected server is not available"))
-            }
+            val serverId = selectedServerId
+                ?: return AppResult.Failure(AppError.Vpn("Select a server first"))
+            val server = servers.firstOrNull { it.id == serverId }
+                ?: return AppResult.Failure(AppError.Vpn("Selected server is not available"))
             if (!server.isSupportedByCurrentLibbox()) {
                 return AppResult.Failure(AppError.Vpn("Selected server uses unsupported VLESS transport"))
             }
@@ -58,7 +68,7 @@ class ConnectVpnUseCase @Inject constructor(
                 )
             }
             if (!snapshot.success) {
-                return AppResult.Failure(AppError.Vpn("Selected server is not reachable on current network"))
+                return AppResult.Failure(AppError.Vpn("Selected server TCP is reachable, but VPN tunnel validation failed"))
             }
             listOfNotNull(server)
         }
@@ -69,6 +79,11 @@ class ConnectVpnUseCase @Inject constructor(
             selected.joinToString { it.displayName },
         )
         if (selected.isEmpty()) return AppResult.Failure(AppError.Vpn("No reachable VPN servers on current network"))
+        Timber.i(
+            "Auto connect pipeline: before connect smart=%s selectedCount=%d",
+            smartSelection,
+            selected.size,
+        )
         return vpnRepository.start(
             servers = selected,
             smartSelection = smartSelection,
@@ -80,7 +95,7 @@ class ConnectVpnUseCase @Inject constructor(
         !rawUri.hasUnsupportedXrayHttpTransport() && outbound.isSupportedByCurrentLibbox()
 
     private fun Outbound.isSupportedByCurrentLibbox(): Boolean = when (this) {
-        is Outbound.Vless -> transport.isSupportedByCurrentLibbox() && security.isSupportedByCurrentLibbox()
+        is Outbound.Vless -> isVlessFlowSupportedByCurrentLibbox(flow) && transport.isSupportedByCurrentLibbox() && security.isSupportedByCurrentLibbox()
         is Outbound.Vmess -> transport.isSupportedByCurrentLibbox() && security.isSupportedByCurrentLibbox()
         is Outbound.Trojan -> transport.isSupportedByCurrentLibbox() && security.isSupportedByCurrentLibbox()
         is Outbound.Shadowsocks -> true
@@ -101,7 +116,7 @@ class ConnectVpnUseCase @Inject constructor(
         UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX.containsMatchIn(this)
 
     private companion object {
-        const val SMART_LIMIT = 32
+        const val SMART_LIMIT = 10
         val UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX = Regex("([?&])type=(xhttp|splithttp)(&|#|$)", RegexOption.IGNORE_CASE)
     }
 }

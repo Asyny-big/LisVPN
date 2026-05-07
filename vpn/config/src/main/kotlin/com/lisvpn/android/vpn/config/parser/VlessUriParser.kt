@@ -4,6 +4,7 @@ import android.net.Uri
 import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Security
 import com.lisvpn.android.core.domain.model.Transport
+import com.lisvpn.android.core.domain.model.normalizeVlessFlowForSingBox
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -66,7 +67,7 @@ class VlessUriParser @Inject constructor() : UriParser {
             host = host,
             port = port,
             uuid = userInfo,
-            flow = params["flow"].takeIf { !it.isNullOrBlank() },
+            flow = normalizeVlessFlowForSingBox(params["flow"]),
             encryption = params["encryption"].orEmpty().ifBlank { "none" },
             transport = transport,
             security = security,

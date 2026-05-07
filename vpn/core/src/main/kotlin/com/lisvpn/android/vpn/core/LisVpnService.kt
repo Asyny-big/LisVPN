@@ -110,28 +110,28 @@ class LisVpnService : VpnService() {
                 return@launch
             }
             Timber.i("libbox start requested")
-            newBridge.start()
-                .onSuccess {
-                    val cs = ConnectedServer(
-                        serverId = serverLabel.orEmpty(),
-                        displayName = serverLabel ?: "Авто",
-                        countryCode = null,
-                    )
-                    val now = Clock.System.now()
-                    activeServer = cs
-                    connectedAt = now
-                    reconnectAttempt = 0
-                    registerNetworkCallback()
-                    controller.publishConnected(cs, now)
-                    updateNotification(VpnState.Connected(cs, now))
-                }
-                .onFailure { err ->
-                    Timber.e(err, "libbox start failed")
-                    unregisterNetworkCallback()
-                    bridge = null
-                    controller.publishError(VpnState.Reason.StartFailed, err.message)
-                    stopSelfCleanly()
-                }
+            val startResult = newBridge.start()
+            if (startResult.isFailure) {
+                val err = startResult.exceptionOrNull()
+                Timber.e(err, "libbox start failed")
+                unregisterNetworkCallback()
+                bridge = null
+                controller.publishError(VpnState.Reason.StartFailed, err?.message)
+                stopSelfCleanly()
+                return@launch
+            }
+            val cs = ConnectedServer(
+                serverId = serverLabel.orEmpty(),
+                displayName = serverLabel ?: "Авто",
+                countryCode = null,
+            )
+            val now = Clock.System.now()
+            activeServer = cs
+            connectedAt = now
+            reconnectAttempt = 0
+            registerNetworkCallback()
+            controller.publishConnected(cs, now)
+            updateNotification(VpnState.Connected(cs, now))
         }
     }
 

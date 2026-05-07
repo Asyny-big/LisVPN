@@ -38,6 +38,13 @@ class LisVpnApp : Application(), Configuration.Provider {
         super.onCreate()
         Timber.plant(LisLogTree(isDebug = BuildConfig.DEBUG))
         Timber.plant(LisFileLogTree(logExporter, isDebug = BuildConfig.DEBUG))
+        val previousUncaughtHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+            runCatching {
+                Timber.e(throwable, "Uncaught exception: thread=%s", thread.name)
+            }
+            previousUncaughtHandler?.uncaughtException(thread, throwable)
+        }
         Timber.i("LisVPN application created (versionName=%s, applicationId=%s)", BuildConfig.VERSION_NAME, BuildConfig.APPLICATION_ID)
     }
 }
