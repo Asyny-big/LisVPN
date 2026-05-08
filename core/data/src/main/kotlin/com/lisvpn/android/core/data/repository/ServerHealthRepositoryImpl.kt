@@ -118,10 +118,9 @@ class ServerHealthRepositoryImpl @Inject constructor(
     override suspend fun rank(servers: List<Server>, limit: Int): List<Server> = withContext(ioDispatcher) {
         if (servers.isEmpty() || limit <= 0) return@withContext emptyList()
 
-        val selectedLimit = limit.coerceAtMost(AUTO_SELECTED_LIMIT)
-        Timber.i("Auto ranking started: servers=%d limit=%d selectedLimit=%d", servers.size, limit, selectedLimit)
+        val selectedLimit = limit.coerceAtMost(AUTO_SELECTED_LIMIT).coerceAtMost(servers.size)
+        Timber.i("Auto ranking started: strategy=tcp-prefilter-runtime-download-urltest servers=%d limit=%d selectedLimit=%d", servers.size, limit, selectedLimit)
 
-        val historicalScores = _scores.value.associateBy { it.serverId }
         val firstPass = probeAll(servers)
         val reachable = firstPass
             .filter { it.isReachable }
@@ -138,32 +137,14 @@ class ServerHealthRepositoryImpl @Inject constructor(
             return@withContext emptyList()
         }
 
-        val protocolCandidates = selectStage1Candidates(
-            reachable = reachable,
-            limit = STAGE1_CANDIDATE_LIMIT.coerceAtMost(reachable.size),
-            scores = historicalScores,
-        )
+        val selected = reachable.take(selectedLimit)
         Timber.i(
-            "Auto scoring started: strategy=protocol stage1Candidates=%d selectedTcp=%s",
-            protocolCandidates.size,
-            protocolCandidates.joinToString { it.diagnosticLabel() },
+            "Auto runtime urltest candidates selected: reachable=%d selected=%d candidates=%s",
+            reachable.size,
+            selected.size,
+            selected.take(AUTO_LOG_CANDIDATE_LIMIT).joinToString { it.diagnosticLabel() },
         )
-        val protocolResults = protocolProbeAll(protocolCandidates.map { it.server })
-        val scored = protocolResults
-            .map { it.toScoredCandidate() }
-            .sortedByProtocolScore()
-        val working = scored.filter { it.result.snapshot.success }
-        Timber.i(
-            "Auto protocol scoring completed: candidates=%d working=%d selected=%s",
-            protocolCandidates.size,
-            working.size,
-            working.take(selectedLimit).joinToString { it.diagnosticLabel() },
-        )
-        if (working.isEmpty()) {
-            Timber.w("Auto ranking stopped: TCP candidates did not pass protocol validation")
-            return@withContext emptyList()
-        }
-        working.take(selectedLimit).map { it.server }
+        selected.map { it.server }
     }
 
     private suspend fun probeAll(servers: List<Server>): List<ProbeCandidate> = coroutineScope {
@@ -494,7 +475,7 @@ class ServerHealthRepositoryImpl @Inject constructor(
         const val VERIFY_CONCURRENCY = 8
         const val PROTOCOL_PROBE_CONCURRENCY = 1
         const val STAGE1_CANDIDATE_LIMIT = 12
-        const val AUTO_SELECTED_LIMIT = 10
+        const val AUTO_SELECTED_LIMIT = 2_000
         const val PREFERRED_CANDIDATE_LIMIT = 4
         const val FASTEST_CANDIDATE_LIMIT = 6
         const val SPREAD_CANDIDATE_LIMIT = 4

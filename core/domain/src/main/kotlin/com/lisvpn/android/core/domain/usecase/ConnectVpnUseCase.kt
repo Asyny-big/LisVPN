@@ -6,6 +6,7 @@ import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Security
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.Transport
+import com.lisvpn.android.core.domain.model.VpnState
 import com.lisvpn.android.core.domain.model.isVlessFlowSupportedByCurrentLibbox
 import com.lisvpn.android.core.domain.repository.ServerHealthRepository
 import com.lisvpn.android.core.domain.repository.ProfileRepository
@@ -13,6 +14,7 @@ import com.lisvpn.android.core.domain.repository.VpnPermissionHandle
 import com.lisvpn.android.core.domain.repository.VpnRepository
 import javax.inject.Inject
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 
 /**
@@ -36,6 +38,8 @@ class ConnectVpnUseCase @Inject constructor(
         if (servers.isEmpty()) return AppResult.Failure(AppError.Vpn("No servers available"))
 
         val selected = if (smartSelection) {
+            val stopResult = stopActiveVpnBeforeAutoSpeedTest()
+            if (stopResult != null) return stopResult
             val compatible = servers.filter { it.isSupportedByCurrentLibbox() }
             Timber.i(
                 "Auto connect pipeline: before scoring available=%d compatible=%d",
@@ -91,6 +95,32 @@ class ConnectVpnUseCase @Inject constructor(
         )
     }
 
+    private suspend fun stopActiveVpnBeforeAutoSpeedTest(): AppResult<Unit>? {
+        return when (vpnRepository.state.value) {
+            is VpnState.Connected,
+            is VpnState.Reconnecting -> {
+                Timber.i("Auto speed-test requested while VPN is active; stopping current tunnel before probing")
+                when (val stop = vpnRepository.stop()) {
+                    is AppResult.Failure -> return AppResult.Failure(AppError.Vpn("Could not stop active VPN before AUTO speed test"), stop.cause)
+                    is AppResult.Success -> Unit
+                }
+                val stopped = withTimeoutOrNull(AUTO_STOP_TIMEOUT_MS) {
+                    vpnRepository.state.firstOrNull { state -> state is VpnState.Idle || state is VpnState.Error }
+                } != null
+                if (!stopped) {
+                    AppResult.Failure(AppError.Vpn("Timed out stopping active VPN before AUTO speed test"))
+                } else {
+                    null
+                }
+            }
+            VpnState.Preparing,
+            is VpnState.Connecting,
+            VpnState.Disconnecting -> AppResult.Failure(AppError.Vpn("VPN transition is already in progress"))
+            VpnState.Idle,
+            is VpnState.Error -> null
+        }
+    }
+
     private fun Server.isSupportedByCurrentLibbox(): Boolean =
         !rawUri.hasUnsupportedXrayHttpTransport() && outbound.isSupportedByCurrentLibbox()
 
@@ -116,7 +146,8 @@ class ConnectVpnUseCase @Inject constructor(
         UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX.containsMatchIn(this)
 
     private companion object {
-        const val SMART_LIMIT = 10
+        const val SMART_LIMIT = 2_000
+        const val AUTO_STOP_TIMEOUT_MS = 5_000L
         val UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX = Regex("([?&])type=(xhttp|splithttp)(&|#|$)", RegexOption.IGNORE_CASE)
     }
 }

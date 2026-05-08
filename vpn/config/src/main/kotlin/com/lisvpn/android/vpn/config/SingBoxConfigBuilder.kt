@@ -355,7 +355,7 @@ class SingBoxConfigBuilder @Inject constructor() {
         const val REMOTE_DNS_ADDRESS = "https://1.1.1.1/dns-query"
         const val LOCAL_DNS_TAG = "local"
         const val BLOCK_DNS_TAG = "block"
-        const val URLTEST_DOMAIN = "www.gstatic.com"
-        const val URLTEST_URL = "https://www.gstatic.com/generate_204"
+        const val URLTEST_DOMAIN = "speed.cloudflare.com"
+        const val URLTEST_URL = "https://speed.cloudflare.com/__down?bytes=1048576"
     }
 }

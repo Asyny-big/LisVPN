@@ -1,10 +1,12 @@
 # Gradle
+
 .gradle/
-build/
+**/build/
 !**/src/**/build/
 out/
 
 # IntelliJ / Android Studio
+
 .idea/
 *.iml
 *.ipr
@@ -13,6 +15,7 @@ captures/
 .navigation/
 
 # Local config
+
 local.properties
 **/local.properties
 keystore.properties
@@ -21,10 +24,12 @@ keystore.properties
 *.p12
 
 # OS
+
 .DS_Store
 Thumbs.db
 
 # Build outputs
+
 *.apk
 *.aab
 *.ap_
@@ -33,16 +38,20 @@ release/
 debug/
 
 # NDK / Native
+
 .cxx/
 
 # KSP / kapt
+
 .kotlin/
 
 # Logs
+
 *.log
 logs/
 
 # Temp
+
 *.tmp
 *.bak
 .libbox-inspect/
