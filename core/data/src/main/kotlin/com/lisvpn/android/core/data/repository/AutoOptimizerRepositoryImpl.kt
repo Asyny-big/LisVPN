@@ -14,15 +14,22 @@ import com.lisvpn.android.core.domain.repository.ServerHealthRepository
 import com.lisvpn.android.core.domain.repository.VpnRepository
 import java.io.BufferedInputStream
 import java.net.HttpURLConnection
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.net.Socket
 import java.net.URL
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -30,7 +37,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.datetime.Clock
@@ -107,15 +116,35 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
                 _status.value = AutoOptimizerStatus.Failed("no candidates")
                 return@withContext PreflightResult(null, null, null, 0)
             }
-            val candidates = indexedServers.take(PREFLIGHT_CANDIDATE_LIMIT)
+
+            // Pre-screen *every* eligible server with a parallel direct TCP probe before the
+            // expensive in-tunnel speed test runs. This is exactly the user complaint: the
+            // previous behaviour just did `take(5)` of the bootstrap-ranked list, which meant a
+            // dead Germany server in slot #2 got speed-tested (and failed) while slots #6+ that
+            // were actually alive never got tested at all. With pre-screening we look at the
+            // whole subscription, drop unreachable servers, and only then take the 5 best
+            // *reachable* ones for the speed test.
+            val reachableCandidates = prescreenReachable(indexedServers)
+            val candidatePool = if (reachableCandidates.isEmpty()) {
+                Timber.w(
+                    "Preflight reachability prescreen returned no candidates; falling back to first %d ranked servers",
+                    PREFLIGHT_CANDIDATE_LIMIT,
+                )
+                indexedServers
+            } else {
+                reachableCandidates
+            }
+            val candidates = selectPreflightCandidates(candidatePool, profile)
             val totalToTest = candidates.size
             val results = mutableListOf<ScoredTunnelCandidate>()
 
             Timber.i(
-                "Preflight started: stage=pre-vpn network=%s fingerprint=%s total=%d candidates=%s",
+                "Preflight started: stage=pre-vpn network=%s fingerprint=%s total=%d eligible=%d reachable=%d candidates=%s",
                 profile.networkClass,
                 profile.fingerprint,
                 totalToTest,
+                indexedServers.size,
+                reachableCandidates.size,
                 candidates.joinToString { it.server.displayName },
             )
 
@@ -170,14 +199,31 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
                 Timber.i("Preflight candidate: %s", results.last().diagnosticLabel())
             }
 
-            val best = results
-                .filter { it.probe.successful }
+            // Stricter "this server actually has working internet" gate. A candidate must have
+            // (a) hit *both* connectivity targets we tried — gstatic AND the unblocked-services
+            // endpoints — *and* (b) actually downloaded some bytes through the tunnel. The
+            // previous filter only required `internetSuccessCount > 0`, which is exactly why a
+            // server that responds to a single small TLS handshake but cannot pass real traffic
+            // could "win" the AUTO pick and leave the user with no internet.
+            val healthyResults = results.filter { it.probe.hasUsableInternet() }
+            val best = healthyResults
                 .sortedWith(
                     compareByDescending<ScoredTunnelCandidate> { it.probe.throughputBytesPerSecond ?: 0L }
                         .thenByDescending { it.score }
                         .thenBy { it.probe.httpRttMs ?: Int.MAX_VALUE },
                 )
                 .firstOrNull()
+                ?: results
+                    // Fallback gate: at least one connectivity check must have passed. Better
+                    // than dropping the user back to "no successful probe" when every candidate
+                    // was rate-limited mid-test.
+                    .filter { it.probe.successful }
+                    .sortedWith(
+                        compareByDescending<ScoredTunnelCandidate> { it.probe.throughputBytesPerSecond ?: 0L }
+                            .thenByDescending { it.score }
+                            .thenBy { it.probe.httpRttMs ?: Int.MAX_VALUE },
+                    )
+                    .firstOrNull()
 
             if (best == null) {
                 Timber.w("Preflight finished: no successful candidate (tested=%d)", results.size)
@@ -325,6 +371,87 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
     }
 
     private fun Long.toKbps(): Long = this * 8L / 1_000L
+
+    /**
+     * Run a parallel direct (non-tunneled) TCP probe against every eligible candidate before the
+     * speed test runs. This filters out servers that are dead, geo-blocked or otherwise
+     * unreachable from the user's current network — so the expensive in-tunnel speed test only
+     * burns budget on candidates that have at least a chance of working. Returns the subset of
+     * [indexedServers] that responded to TCP within [REACHABILITY_PROBE_TIMEOUT_MS].
+     */
+    private suspend fun prescreenReachable(
+        indexedServers: List<OptimizationCandidate>,
+    ): List<OptimizationCandidate> = coroutineScope {
+        // Cap parallelism so we don't open hundreds of sockets on cellular (some carriers will
+        // throttle / NAT-collapse anything that aggressive).
+        val semaphore = kotlinx.coroutines.sync.Semaphore(REACHABILITY_PROBE_PARALLELISM)
+        indexedServers
+            .map { candidate ->
+                async(Dispatchers.IO) {
+                    semaphore.withPermit {
+                        val reachable = withTimeoutOrNull(REACHABILITY_PROBE_TIMEOUT_MS) {
+                            tcpReachable(candidate.server)
+                        } == true
+                        candidate.takeIf { reachable }
+                    }
+                }
+            }
+            .awaitAll()
+            .filterNotNull()
+    }
+
+    private suspend fun tcpReachable(server: Server): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            // Resolve the server hostname directly — outbound.host may be a DNS name we have
+            // never resolved before (e.g. fresh subscription). We prefer Inet4Address because
+            // most carriers in the user's region either NAT v6 or drop it entirely, which would
+            // give false negatives. We fall back to v6 only if no v4 address resolves.
+            val host = server.outbound.host.ifBlank { return@runCatching false }
+            val port = server.outbound.port
+            if (port <= 0) return@runCatching false
+            val resolved = runCatching { InetAddress.getAllByName(host) }
+                .getOrElse { return@runCatching false }
+            val addresses = resolved.filterIsInstance<Inet4Address>().ifEmpty { resolved.toList() }
+            for (address in addresses) {
+                val ok = runCatching {
+                    Socket().use { socket ->
+                        socket.tcpNoDelay = true
+                        socket.connect(InetSocketAddress(address, port), REACHABILITY_CONNECT_TIMEOUT_MS)
+                        socket.isConnected
+                    }
+                }.getOrDefault(false)
+                if (ok) return@runCatching true
+            }
+            false
+        }.getOrElse { false }
+    }
+
+    /**
+     * Pick the 5 servers we'll actually run the speed test on, given the *reachable* pool.
+     * Prefers Mobile-Bypass-tagged servers when on cellular, then primary-tagged servers, then
+     * the remaining reachable list in its existing rank-induced order.
+     */
+    private fun selectPreflightCandidates(
+        reachable: List<OptimizationCandidate>,
+        profile: AutoNetworkProfile,
+    ): List<OptimizationCandidate> {
+        val ordered = linkedMapOf<String, OptimizationCandidate>()
+        fun add(c: OptimizationCandidate) {
+            if (ordered.size < PREFLIGHT_CANDIDATE_LIMIT) ordered.putIfAbsent(c.server.id, c)
+        }
+
+        if (profile.isMobileLike) {
+            reachable
+                .filter { Server.Tag.MobileBypass in it.server.tags }
+                .forEach(::add)
+        }
+        reachable
+            .filter { Server.Tag.Primary in it.server.tags }
+            .forEach(::add)
+        reachable.forEach(::add)
+
+        return ordered.values.toList()
+    }
 
     private fun selectOptimizationCandidates(
         indexedServers: List<OptimizationCandidate>,
@@ -500,6 +627,12 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
         const val PREFLIGHT_CANDIDATE_LIMIT = 5
         const val PREFLIGHT_CANDIDATE_PROBE_TIMEOUT_MS = 5_000L
         const val PREFLIGHT_CANDIDATE_WARMUP_MS = 200L
+        // Direct (no-tunnel) TCP reachability prescreen budget. Each candidate gets a 2.5 s
+        // connect timeout, and we run up to REACHABILITY_PROBE_PARALLELISM probes concurrently
+        // — so even with 50 servers in the subscription the prescreen finishes inside ~3 s.
+        const val REACHABILITY_PROBE_TIMEOUT_MS = 3_000L
+        const val REACHABILITY_CONNECT_TIMEOUT_MS = 2_500
+        const val REACHABILITY_PROBE_PARALLELISM = 8
         // 50 Mbps is a more realistic upper bound for a fast residential VPN; the old 3 Mbps cap
         // saturated the throughput component for almost every server, which silently neutralised
         // its weight in the optimiser score.
@@ -556,7 +689,7 @@ private object AutoTunnelProbe {
             val blockedChecks = listOf(YOUTUBE_URL, TELEGRAM_URL).map { url ->
                 measureStatusUrl(url, acceptRedirects = true)
             }
-            val speed = measureDownloadBytesPerSecond(SPEED_URL)
+            val speed = measureDownloadBytesPerSecond()
             val stabilityChecks = List(STABILITY_CHECK_COUNT) { measureStatusUrl(CONNECTIVITY_URL) }
 
             AutoTunnelProbeResult(
@@ -607,6 +740,25 @@ private object AutoTunnelProbe {
         }.getOrElse {
             ProbeStep(success = false, elapsedMs = elapsedSince(startedAt))
         }
+    }
+
+    /**
+     * Measures download throughput against a list of fallback endpoints. Some Russian mobile
+     * carriers DPI-block speed.cloudflare.com (which is exactly why the user reported "speed is
+     * never shown on cellular but works on Wi-Fi"). When the primary endpoint fails or returns
+     * zero bytes we fall through to a smaller Cloudflare DoH-adjacent file and Google's
+     * Connectivity-Check binary, which behave more like ordinary HTTPS traffic and tend to make
+     * it through.
+     */
+    private fun measureDownloadBytesPerSecond(): DownloadStep {
+        for (url in SPEED_URLS) {
+            val step = measureDownloadBytesPerSecond(url)
+            val bytesPerSecond = step.bytesPerSecond
+            if (bytesPerSecond != null && bytesPerSecond > 0L) {
+                return step
+            }
+        }
+        return DownloadStep(null)
     }
 
     private fun measureDownloadBytesPerSecond(url: String): DownloadStep {
@@ -661,7 +813,17 @@ private object AutoTunnelProbe {
     // and not just slow-start. With the 256 KiB chunk we used previously, a fast and a slow tunnel
     // routinely landed within a couple kbps of each other on cellular, which is exactly the
     // "the auto-mode does not really test download speed" complaint we're trying to fix.
-    private const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=2097152"
+    //
+    // We try multiple endpoints in order. speed.cloudflare.com is the canonical choice but is
+    // routinely DPI-blocked or rate-limited on Russian mobile carriers — that's why the user
+    // saw "no speed shown" on cellular but a number on Wi-Fi. The fallbacks are vanilla HTTPS
+    // downloads on commodity CDNs (Google's CRT mirror, Cloudflare's marketing CDN) that
+    // generally make it through DPI even when speed.cloudflare.com is blocked.
+    private val SPEED_URLS = listOf(
+        "https://speed.cloudflare.com/__down?bytes=2097152",
+        "https://www.cloudflare.com/cdn-cgi/trace",
+        "https://connectivitycheck.gstatic.com/generate_204",
+    )
     private const val HTTP_RTT_SAMPLE_COUNT = 2
     private const val STABILITY_CHECK_COUNT = 1
     private const val CONNECT_TIMEOUT_MS = 4_000
@@ -686,6 +848,20 @@ private data class AutoTunnelProbeResult(
 ) {
     val successful: Boolean
         get() = internetSuccessCount > 0
+
+    /**
+     * "All AUTO probes look healthy" — every connectivity check we ran (gstatic / generate_204
+     * AND the unblocked-services targets) actually returned, *and* we managed to pump some bytes
+     * through the tunnel. This is the strict gate we want for picking a winner so a server that
+     * passes a single small TLS handshake but cannot move real traffic does not become the AUTO
+     * pick.
+     */
+    fun hasUsableInternet(): Boolean {
+        val internetOk = internetCheckCount > 0 && internetSuccessCount >= internetCheckCount
+        val blockedOk = blockedCheckCount == 0 || blockedSuccessCount > 0
+        val throughputOk = (throughputBytesPerSecond ?: 0L) > 0L
+        return internetOk && blockedOk && throughputOk
+    }
 
     val packetLossRatio: Double
         get() {

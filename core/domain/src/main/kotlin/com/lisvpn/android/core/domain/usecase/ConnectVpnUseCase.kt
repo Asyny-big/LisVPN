@@ -80,15 +80,40 @@ class ConnectVpnUseCase @Inject constructor(
                 )
                 return AppResult.Failure(AppError.Vpn("Selected server is $specialReason and cannot be used as a general VPN"))
             }
-            val snapshot = when (val probeResult = serverHealthRepository.probe(server)) {
-                is AppResult.Success -> probeResult.value
-                is AppResult.Failure -> return AppResult.Failure(
-                    AppError.Vpn("Selected server is not reachable on current network"),
-                    probeResult.cause,
-                )
-            }
-            if (!snapshot.success) {
-                return AppResult.Failure(AppError.Vpn("Selected server TCP is reachable, but VPN tunnel validation failed"))
+            // Manual mode: the user explicitly picked this server — they want to *try* it.
+            // The lightweight probe we run here is unreliable for some legitimate configs:
+            //  * Reality servers reject our generic TLS handshake (the probe only verifies
+            //    that sni/publicKey are non-empty, not that the server actually responds).
+            //  * VLESS-over-WebSocket / HttpUpgrade transports often fail the plain HTTP probe
+            //    because the server expects the VLESS protocol envelope first and just hangs.
+            //  * On Russian mobile networks, DPI on commodity TLS targets can falsely flag a
+            //    healthy server as broken.
+            // Previous behaviour rejected the user's choice with "VPN tunnel validation failed"
+            // any time one of the above misfired — which is exactly the "second server in
+            // manual mode never works" complaint. We now treat the probe as advisory: we still
+            // run it (so we collect health metrics and surface obviously dead servers), but a
+            // probe-level failure no longer prevents the connection attempt. libbox itself will
+            // be the real validator and will surface a clear error if the handshake fails.
+            when (val probeResult = serverHealthRepository.probe(server)) {
+                is AppResult.Success -> {
+                    val snapshot = probeResult.value
+                    if (!snapshot.success) {
+                        Timber.w(
+                            "Manual probe reported soft failure (proceeding anyway): server=%s tcp=%sms tls=%sms http=%sms",
+                            server.displayName,
+                            snapshot.tcpHandshakeMs,
+                            snapshot.tlsHandshakeMs,
+                            snapshot.httpRttMs,
+                        )
+                    }
+                }
+                is AppResult.Failure -> {
+                    Timber.w(
+                        probeResult.cause,
+                        "Manual probe crashed (proceeding anyway): server=%s",
+                        server.displayName,
+                    )
+                }
             }
             listOfNotNull(server)
         }
