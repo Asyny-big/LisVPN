@@ -18,7 +18,6 @@ import com.lisvpn.android.core.domain.model.VpnState
 import com.lisvpn.android.core.domain.repository.AppRulesRepository
 import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
 import com.lisvpn.android.vpn.libbox.LibboxBridge
-import java.io.File
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
