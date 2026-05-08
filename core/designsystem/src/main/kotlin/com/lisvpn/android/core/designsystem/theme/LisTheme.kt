@@ -40,11 +40,11 @@ fun LisTheme(
             onPrimaryContainer = LisPalette.BrandAmberSoft,
             secondary = LisPalette.NeutralDark30,
             onSecondary = LisPalette.NeutralDark90,
-            background = LisPalette.NeutralDark0,
+            background = LisPalette.SurfaceDark0,
             onBackground = LisPalette.NeutralDark90,
-            surface = LisPalette.NeutralDark10,
+            surface = LisPalette.SurfaceDark1,
             onSurface = LisPalette.NeutralDark90,
-            surfaceVariant = LisPalette.NeutralDark20,
+            surfaceVariant = LisPalette.SurfaceDark2,
             onSurfaceVariant = LisPalette.NeutralDark90.copy(alpha = 0.78f),
             error = LisPalette.ErrorRed,
             onError = LisPalette.NeutralDark0,
@@ -69,8 +69,14 @@ fun LisTheme(
     }
 
     val statusColors = if (useDarkTheme) DarkStatusColors else LightStatusColors
+    val gradients = if (useDarkTheme) DarkLisGradients else LightLisGradients
 
-    CompositionLocalProvider(LocalLisStatusColors provides statusColors) {
+    CompositionLocalProvider(
+        LocalLisStatusColors provides statusColors,
+        LocalLisGradients provides gradients,
+        LocalLisSpacing provides DefaultLisSpacing,
+        LocalLisMotion provides DefaultLisMotion,
+    ) {
         MaterialTheme(
             colorScheme = colorScheme,
             typography = LisTypography,
@@ -85,4 +91,19 @@ object LisTheme {
         @Composable
         @androidx.compose.runtime.ReadOnlyComposable
         get() = LocalLisStatusColors.current
+
+    val gradients: LisGradients
+        @Composable
+        @androidx.compose.runtime.ReadOnlyComposable
+        get() = LocalLisGradients.current
+
+    val spacing: LisSpacing
+        @Composable
+        @androidx.compose.runtime.ReadOnlyComposable
+        get() = LocalLisSpacing.current
+
+    val motion: LisMotion
+        @Composable
+        @androidx.compose.runtime.ReadOnlyComposable
+        get() = LocalLisMotion.current
 }

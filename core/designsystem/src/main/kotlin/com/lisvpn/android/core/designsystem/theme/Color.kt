@@ -3,7 +3,8 @@ package com.lisvpn.android.core.designsystem.theme
 import androidx.compose.ui.graphics.Color
 
 /**
- * LisVPN palette. Neutral, calm, with a single warm accent (the «fox» — lis).
+ * LisVPN palette. Neutral, calm, with a single warm accent (the «fox» — lis) and a pair of
+ * aurora hues used for depth and motion.
  *
  * Naming follows Material 3 role tokens; raw colour values are private to keep semantics
  * the only public contract.
@@ -12,6 +13,11 @@ internal object LisPalette {
     val BrandAmber = Color(0xFFFF8A3D)
     val BrandAmberDeep = Color(0xFFE56F1F)
     val BrandAmberSoft = Color(0xFFFFE0C8)
+
+    // Aurora accents — used in gradients, orb halos, aurora field.
+    val BrandAuroraPurple = Color(0xFF7B61FF)
+    val BrandAuroraTeal = Color(0xFF22D3C5)
+    val BrandAuroraPink = Color(0xFFFF6FA1)
 
     val NeutralLight0 = Color(0xFFFAF7F2)
     val NeutralLight10 = Color(0xFFF1ECE3)
@@ -24,6 +30,16 @@ internal object LisPalette {
     val NeutralDark20 = Color(0xFF1B232C)
     val NeutralDark30 = Color(0xFF2A323D)
     val NeutralDark90 = Color(0xFFE7EDF4)
+
+    // Layered surfaces for the redesigned dark theme — aligns with the §1 design language
+    // (deeper background to let the aurora field pop without losing AMOLED battery savings).
+    val SurfaceDark0 = Color(0xFF080B11)
+    val SurfaceDark1 = Color(0xFF0E141C)
+    val SurfaceDark2 = Color(0xFF161E28)
+    val SurfaceDark3 = Color(0xFF1F2933)
+
+    val HairlineLight = Color(0x14000000) // 8% black
+    val HairlineDark = Color(0x1AFFFFFF)   // 10% white
 
     val SuccessGreen = Color(0xFF34C759)
     val SuccessGreenDim = Color(0xFF1F8A3F)
