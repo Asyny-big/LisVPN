@@ -78,6 +78,11 @@ class LisVpnService : VpnService() {
     private var reconnectWakeJob: Job? = null
     private var failoverJob: Job? = null
     private var sleepingForNetwork: Boolean = false
+    // Set when manual-mode tunnel validation finishes without proving the tunnel carries
+    // HTTP traffic. We still keep the tunnel up because the user explicitly picked the server,
+    // but we surface this in the foreground notification so "VPN connected but no internet"
+    // does not look identical to a healthy session.
+    private var manualValidationWarning: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -410,14 +415,27 @@ class LisVpnService : VpnService() {
             validation.averageRttMs,
             validation.failureReason,
         )
-        if (validation.eligible) return true
+        if (validation.eligible) {
+            manualValidationWarning = null
+            return true
+        }
 
+        manualValidationWarning = buildManualValidationWarning(validation)
         Timber.w(
             "Manual tunnel validation failed, continuing because the user explicitly selected this server: server=%s reason=%s",
             server.displayName,
             validation.failureReason,
         )
         return true
+    }
+
+    private fun buildManualValidationWarning(
+        validation: com.lisvpn.android.vpn.health.TunnelValidationResult,
+    ): String {
+        if (!validation.dnsWorks) return "DNS не работает через тоннель"
+        val reason = validation.failureReason
+        return if (!reason.isNullOrBlank()) "тоннель не пропускает HTTP ($reason)"
+        else "тоннель не пропускает HTTP"
     }
 
     private fun startAutoFailover(result: AutoSelectionResult) {
@@ -646,6 +664,7 @@ class LisVpnService : VpnService() {
         connectedAt = null
         reconnectAttempt = 0
         sleepingForNetwork = false
+        manualValidationWarning = null
     }
 
     private suspend fun suspendForNetwork(runningBridge: LibboxBridge, reason: String) {
@@ -704,7 +723,18 @@ class LisVpnService : VpnService() {
 
     private fun updateNotification(state: VpnState) {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(VpnNotifier.NOTIFICATION_ID, notifier.build(state = state, openAppPendingIntent = openAppPendingIntent()))
+        // Only attach the warning when the state is Connected — Reconnecting/Connecting/Error
+        // already convey their own status and the warning is only meaningful for the steady
+        // "tunnel up" notification.
+        val warning = manualValidationWarning?.takeIf { state is VpnState.Connected }
+        nm.notify(
+            VpnNotifier.NOTIFICATION_ID,
+            notifier.build(
+                state = state,
+                openAppPendingIntent = openAppPendingIntent(),
+                manualWarning = warning,
+            ),
+        )
     }
 
     private fun stopSelfCleanly() {

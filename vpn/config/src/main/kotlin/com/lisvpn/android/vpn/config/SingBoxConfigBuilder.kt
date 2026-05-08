@@ -9,11 +9,15 @@ import com.lisvpn.android.core.domain.model.normalizeVlessFlowForSingBox
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.addJsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import timber.log.Timber
@@ -98,7 +102,9 @@ class SingBoxConfigBuilder @Inject constructor() {
             }
             put("route", buildRoute(finalTag, optimizerEnabled = includeSelector))
         }
-        return json.encodeToString(JsonObject.serializer(), root)
+        val encoded = json.encodeToString(JsonObject.serializer(), root)
+        logRedactedConfig(label = "manual/auto", root = root)
+        return encoded
     }
 
     /**
@@ -141,7 +147,60 @@ class SingBoxConfigBuilder @Inject constructor() {
             }
             put("route", buildPreflightRoute())
         }
-        return json.encodeToString(JsonObject.serializer(), root)
+        val encoded = json.encodeToString(JsonObject.serializer(), root)
+        logRedactedConfig(label = "preflight", root = root)
+        return encoded
+    }
+
+    /**
+     * Dumps the generated sing-box config to the log with sensitive fields redacted. This is the
+     * single most useful piece of context when a user reports "manual server X doesn't carry
+     * traffic" — it lets us see exactly what JSON was handed to libbox without ever leaking the
+     * user's UUID, password, REALITY public_key/short_id, or transport credentials.
+     */
+    private fun logRedactedConfig(label: String, root: JsonObject) {
+        runCatching {
+            val redacted = redactConfig(root)
+            val pretty = REDACTED_PRINTER.encodeToString(JsonObject.serializer(), redacted)
+            // Long configs would otherwise be silently truncated by Logcat's per-line limit.
+            val tag = "sing-box-config[$label]"
+            pretty.chunked(LOG_CHUNK_LIMIT).forEachIndexed { index, chunk ->
+                Timber.tag(tag).i("[%02d] %s", index, chunk)
+            }
+        }.onFailure { Timber.w(it, "Failed to log redacted sing-box config") }
+    }
+
+    private fun redactConfig(root: JsonObject): JsonObject = buildJsonObject {
+        root.forEach { (key, value) ->
+            put(key, redactJson(key, value))
+        }
+    }
+
+    private fun redactJson(key: String, value: JsonElement): JsonElement {
+        if (key in SENSITIVE_KEYS) {
+            return when (value) {
+                is JsonPrimitive -> JsonPrimitive(redactPrimitive(value.contentOrNull))
+                else -> JsonPrimitive("[redacted]")
+            }
+        }
+        return when (value) {
+            is JsonObject -> buildJsonObject {
+                value.forEach { (childKey, childValue) ->
+                    put(childKey, redactJson(childKey, childValue))
+                }
+            }
+            is JsonArray -> buildJsonArray {
+                value.forEach { element -> add(redactJson(key, element)) }
+            }
+            else -> value
+        }
+    }
+
+    private fun redactPrimitive(content: String?): String {
+        if (content.isNullOrEmpty()) return "[empty]"
+        val length = content.length
+        val prefix = content.take(2)
+        return "[redacted len=$length prefix=${prefix.replace(Regex("[^A-Za-z0-9_-]"), "?")}]"
     }
 
     // ---- Inbound -----------------------------------------------------------
@@ -475,5 +534,21 @@ class SingBoxConfigBuilder @Inject constructor() {
         const val LOCAL_DNS_TAG = "local"
         const val LOCAL_DNS_ADDRESS = "https://8.8.8.8/dns-query"
         const val BLOCK_DNS_TAG = "block"
+
+        const val LOG_CHUNK_LIMIT = 3500
+
+        val SENSITIVE_KEYS = setOf(
+            "uuid",
+            "password",
+            "method",
+            "public_key",
+            "short_id",
+            "private_key",
+            "early_data_header_name",
+            "service_name",
+            "path",
+        )
+
+        val REDACTED_PRINTER = Json { prettyPrint = true; encodeDefaults = false }
     }
 }

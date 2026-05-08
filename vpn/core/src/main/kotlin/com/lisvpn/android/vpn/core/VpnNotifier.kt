@@ -42,11 +42,25 @@ class VpnNotifier @Inject constructor(
         }
     }
 
-    fun build(state: VpnState, openAppPendingIntent: PendingIntent?): Notification {
+    fun build(
+        state: VpnState,
+        openAppPendingIntent: PendingIntent?,
+        manualWarning: String? = null,
+    ): Notification {
         ensureChannels()
         val (title, text) = when (state) {
             is VpnState.Connecting -> "Подключение…" to (state.serverDisplayName ?: "Поиск маршрута")
-            is VpnState.Connected -> "VPN включён" to "${state.server.displayName}${state.pingMs?.let { " · $it ms" } ?: ""}"
+            is VpnState.Connected -> {
+                val base = "${state.server.displayName}${state.pingMs?.let { " · $it ms" } ?: ""}"
+                if (manualWarning.isNullOrBlank()) {
+                    "VPN включён" to base
+                } else {
+                    // Manual mode: tunnel is up but validation HTTP probes did not return success.
+                    // The connection still proceeds (user explicitly picked this server) but show a
+                    // warning so the user can tell whether "no internet" is real or a probe glitch.
+                    "VPN включён · сервер не отвечает" to "$base — $manualWarning"
+                }
+            }
             is VpnState.Reconnecting -> "Переподключение" to (state.previousServerDisplayName ?: "")
             is VpnState.Error -> "Ошибка" to (state.detail ?: state.reason.name)
             VpnState.Preparing -> "Подключение…" to "Запрос разрешения VPN"

@@ -59,6 +59,11 @@ class LibboxBridge(
             ensureInitialized()
             Libbox.setMemoryLimit(true)
 
+            // Log libbox version up front so that bug reports always identify which sing-box
+            // build the user was on. Specific protocols (notably VLESS+REALITY+Vision) have
+            // had compatibility fixes across releases, so the version is critical context.
+            Timber.tag("libbox-runtime").i("libbox version=%s configBytes=%d", Libbox.version(), configJson.length)
+
             val newPlatform = LisPlatformInterface(service = service, appRules = appRules)
             platform = newPlatform
             val newBox = Libbox.newService(configJson, newPlatform)
