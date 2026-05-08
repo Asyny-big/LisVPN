@@ -95,8 +95,12 @@ class HomeViewModel @Inject constructor(
 
     fun onConnectionModeSelected(mode: HomeConnectionMode) {
         connectionMode.value = mode
-        if (mode == HomeConnectionMode.Manual && selectedServerId.value == null) {
-            selectedServerId.value = uiState.value.servers.firstOrNull()?.id
+        if (mode == HomeConnectionMode.Manual) {
+            val manualServerIds = uiState.value.servers.map { it.id }.toSet()
+            val selectedId = selectedServerId.value
+            if (selectedId == null || selectedId !in manualServerIds) {
+                selectedServerId.value = uiState.value.servers.firstOrNull()?.id
+            }
         }
     }
 

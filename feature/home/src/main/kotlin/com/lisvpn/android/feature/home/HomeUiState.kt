@@ -4,6 +4,7 @@ import com.lisvpn.android.core.designsystem.component.StatusOrbState
 import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.VpnState
+import com.lisvpn.android.core.domain.model.isGeneralVpnEligible
 
 /**
  * Immutable view-model state for the Home screen.
@@ -46,13 +47,14 @@ data class HomeUiState(
             connectionMode: HomeConnectionMode,
             selectedServerId: String?,
         ): HomeUiState {
-            val selected = allServers.firstOrNull { it.id == selectedServerId }
+            val manualServers = allServers.filter { it.isGeneralVpnEligible() }
+            val selected = manualServers.firstOrNull { it.id == selectedServerId }
             val hasServers = allServers.isNotEmpty()
             val base = Empty.copy(
                 activeProfileName = profileName,
                 activeServerCount = allServers.size,
                 connectionMode = connectionMode,
-                servers = allServers.map { server ->
+                servers = manualServers.map { server ->
                     HomeServerOption(
                         id = server.id,
                         title = server.displayName,

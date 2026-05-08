@@ -48,7 +48,7 @@ class VpnRepositoryImpl @Inject constructor(
                     if (index == 0) server.withResolvedHost() else server
                 }
             } else {
-                servers.map { it.withResolvedHost() }
+                servers
             }
         }
         return controller.start(
