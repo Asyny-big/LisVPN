@@ -27,8 +27,8 @@ data class HomeUiState(
 
     fun withOptimizerStatus(status: AutoOptimizerUiStatus): HomeUiState {
         if (status == optimizer) return this
-        // We overlay a subtitle line whenever AUTO is filtering, validating or speed-testing
-        // candidates through the live tunnel.
+        // We overlay a generic line while AUTO filters, validates and tests candidates. Detailed
+        // server/speed telemetry stays in logs only.
         val statusLine = status.toSubtitleLine()
         val nextSubtitle = if (statusLine != null &&
             (orb == StatusOrbState.Connecting || orb == StatusOrbState.Connected)
@@ -177,40 +177,18 @@ sealed interface AutoOptimizerUiStatus {
 
 fun AutoOptimizerUiStatus.toSubtitleLine(): String? = when (this) {
     AutoOptimizerUiStatus.Idle -> null
-    is AutoOptimizerUiStatus.Probing -> buildString {
-        append("Тест скорости ")
-        append(current)
-        append('/')
-        append(total)
-        append(" · ")
-        append(serverDisplayName)
-        val lastSpeed = lastSpeedKbps
-        val lastName = lastServerDisplayName
-        if (lastSpeed != null && lastName != null) {
-            append(" (")
-            append(lastName)
-            append(": ")
-            append(formatKbps(lastSpeed))
-            append(')')
-        }
-    }
-    is AutoOptimizerUiStatus.Done -> buildString {
-        append("Лучший: ")
-        append(bestServerDisplayName)
-        bestSpeedKbps?.let {
-            append(" · ")
-            append(formatKbps(it))
-        }
-        append(" (тест ")
-        append(tested)
-        append(" серверов)")
-    }
+    is AutoOptimizerUiStatus.Probing -> progressLine()
+    is AutoOptimizerUiStatus.Done -> null
 }
 
-private fun formatKbps(kbps: Long): String = when {
-    kbps >= 1_000L -> "${"%.1f".format(kbps / 1_000.0)} Мбит/с"
-    else -> "$kbps кбит/с"
+private fun AutoOptimizerUiStatus.Probing.progressLine(): String {
+    if (total <= 1) return "Выбираем лучший сервер…"
+    if (total > AUTO_VISIBLE_PROGRESS_LIMIT) return "Анализируем доступные серверы…"
+    val safeCurrent = current.coerceIn(1, total)
+    return "Проверяем серверы: $safeCurrent/$total"
 }
+
+private const val AUTO_VISIBLE_PROGRESS_LIMIT = 12
 
 private fun Server.uiSubtitle(): String = listOfNotNull(
     countryCode?.uppercase(),

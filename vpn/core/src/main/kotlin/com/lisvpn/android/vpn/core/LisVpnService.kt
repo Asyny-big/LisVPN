@@ -14,6 +14,7 @@ import android.os.Build
 import com.lisvpn.android.core.common.dispatchers.IoDispatcher
 import com.lisvpn.android.core.domain.model.AppRules
 import com.lisvpn.android.core.domain.model.ConnectedServer
+import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.VpnState
 import com.lisvpn.android.core.domain.repository.AppRulesRepository
 import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
@@ -174,6 +175,15 @@ class LisVpnService : VpnService() {
                 stopSelfCleanly()
                 return@launch
             }
+            val manualCandidate = pending
+                ?.takeIf { !it.smartSelection }
+                ?.candidates
+                ?.singleOrNull()
+            if (manualCandidate != null && !validateManualTunnel(newBridge, manualCandidate)) {
+                bridge = null
+                stopSelfCleanly()
+                return@launch
+            }
             val autoResult = if (autoPlan != null) {
                 try {
                     runAutoTunnelValidation(newBridge, autoPlan)
@@ -211,7 +221,7 @@ class LisVpnService : VpnService() {
         }
     }
 
-    private suspend fun buildAutoSelectionPlan(candidates: List<com.lisvpn.android.core.domain.model.Server>): AutoSelectionPlan? {
+    private suspend fun buildAutoSelectionPlan(candidates: List<Server>): AutoSelectionPlan? {
         val profile = smartServerCache.currentProfile()
         val tagged = candidates.mapIndexed { index, server -> TaggedServer(server, "srv-$index") }
         autoOptimizerRepository.report(
@@ -249,13 +259,14 @@ class LisVpnService : VpnService() {
         runningBridge: LibboxBridge,
         plan: AutoSelectionPlan,
     ): AutoSelectionResult? {
+        val validationCandidates = plan.shortlist.take(AUTO_TUNNEL_VALIDATION_LIMIT)
         val scored = mutableListOf<ScoredAutoServer>()
         var lastSuccessful: ScoredAutoServer? = null
-        for ((index, candidate) in plan.shortlist.withIndex()) {
+        for ((index, candidate) in validationCandidates.withIndex()) {
             autoOptimizerRepository.report(
                 AutoOptimizerStatus.Probing(
                     current = index + 1,
-                    total = plan.shortlist.size,
+                    total = validationCandidates.size,
                     serverDisplayName = candidate.server.displayName,
                     lastSpeedKbps = lastSuccessful?.throughput?.kbps,
                     lastServerDisplayName = lastSuccessful?.server?.displayName,
@@ -305,6 +316,16 @@ class LisVpnService : VpnService() {
                 validation.packetLossApprox,
                 validation.failureReason,
             )
+            val bestSoFar = lastSuccessful
+            if (bestSoFar != null && shouldStopAutoValidation(scored.size, bestSoFar)) {
+                Timber.i(
+                    "AUTO validation stopped early: best=%s tested=%d speedKbps=%s",
+                    bestSoFar.server.displayName,
+                    scored.size,
+                    bestSoFar.throughput?.kbps,
+                )
+                break
+            }
         }
 
         val validated = scored
@@ -316,8 +337,36 @@ class LisVpnService : VpnService() {
             )
         val best = validated.firstOrNull()
         if (best == null) {
-            autoOptimizerRepository.report(AutoOptimizerStatus.Failed("no server with working internet"))
-            return null
+            val fallback = scored.firstOrNull()
+                ?: validationCandidates.firstOrNull()?.let { candidate ->
+                    val validation = com.lisvpn.android.vpn.health.TunnelValidationResult.failed(
+                        serverId = candidate.server.id,
+                        reason = "not validated",
+                    )
+                    ScoredAutoServer(
+                        candidate = candidate,
+                        validation = validation,
+                        throughput = null,
+                        score = scoreCalculator.score(candidate, validation, null, plan.profile),
+                    )
+                }
+                ?: return null
+            runningBridge.selectOutbound(AUTO_SELECTOR_TAG, fallback.outboundTag)
+                .onFailure { Timber.w(it, "Failed to switch AUTO selector to fallback server") }
+            autoOptimizerRepository.report(
+                AutoOptimizerStatus.Done(
+                    bestServerDisplayName = fallback.server.displayName,
+                    bestSpeedKbps = null,
+                    tested = scored.size,
+                ),
+            )
+            Timber.w(
+                "AUTO selection fallback: no validated server, continuing with bootstrap server=%s tag=%s tested=%d",
+                fallback.server.displayName,
+                fallback.outboundTag,
+                scored.size,
+            )
+            return AutoSelectionResult(profile = plan.profile, best = fallback, validated = emptyList())
         }
         runningBridge.selectOutbound(AUTO_SELECTOR_TAG, best.outboundTag)
             .onFailure { Timber.w(it, "Failed to switch AUTO selector to validated winner") }
@@ -338,6 +387,37 @@ class LisVpnService : VpnService() {
             best.throughput?.kbps,
         )
         return AutoSelectionResult(profile = plan.profile, best = best, validated = validated)
+    }
+
+    private fun shouldStopAutoValidation(tested: Int, currentBest: ScoredAutoServer): Boolean {
+        val speedKbps = currentBest.throughput?.kbps ?: 0L
+        return speedKbps >= AUTO_GOOD_ENOUGH_SPEED_KBPS || tested >= AUTO_MIN_TESTED_AFTER_SUCCESS
+    }
+
+    private suspend fun validateManualTunnel(
+        @Suppress("UNUSED_PARAMETER") runningBridge: LibboxBridge,
+        server: Server,
+    ): Boolean {
+        delay(MANUAL_VALIDATION_WARMUP_MS)
+        val validation = tunnelValidationWorker.validateManual(server.id)
+        Timber.i(
+            "Manual tunnel validation: server=%s eligible=%s dns=%s http=%d/%d rtt=%sms reason=%s",
+            server.displayName,
+            validation.eligible,
+            validation.dnsWorks,
+            validation.successCount,
+            validation.checkCount,
+            validation.averageRttMs,
+            validation.failureReason,
+        )
+        if (validation.eligible) return true
+
+        Timber.w(
+            "Manual tunnel validation failed, continuing because the user explicitly selected this server: server=%s reason=%s",
+            server.displayName,
+            validation.failureReason,
+        )
+        return true
     }
 
     private fun startAutoFailover(result: AutoSelectionResult) {
@@ -658,6 +738,10 @@ class LisVpnService : VpnService() {
         const val RECONNECT_JITTER_MS = 1_500L
         const val RECONNECT_MAX_EXPONENT = 5
         const val AUTO_SHORTLIST_LIMIT = 8
+        const val AUTO_TUNNEL_VALIDATION_LIMIT = 4
+        const val AUTO_MIN_TESTED_AFTER_SUCCESS = 3
+        const val AUTO_GOOD_ENOUGH_SPEED_KBPS = 1_500L
+        const val MANUAL_VALIDATION_WARMUP_MS = 1_200L
         const val FIRST_SELECTOR_SWITCH_WARMUP_MS = 1_800L
         const val SELECTOR_SWITCH_WARMUP_MS = 1_000L
         // Mirrors com.lisvpn.android.vpn.config.SingBoxConfigBuilder.AUTO_TAG. Kept private over

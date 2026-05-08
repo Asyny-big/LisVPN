@@ -55,6 +55,10 @@ class SingBoxConfigBuilder @Inject constructor() {
         check(outboundTags.distinct().size == outboundTags.size) { "Generated duplicate outbound tags" }
         val includeSelector = smartSelection && servers.size > 1
         val finalTag = if (includeSelector) AUTO_TAG else outboundTags.first()
+        // Manual mode has no alternate outbound to fail over to. Some valid user-selected servers
+        // cannot reach our public DoH endpoint through the tunnel, so use direct DoH for DNS while
+        // still routing resolved destination traffic through the selected VPN outbound.
+        val directDnsForAllDomains = !smartSelection && servers.size == 1
         check(!includeSelector || outboundTags.isNotEmpty()) { "Cannot build selector without server outbounds" }
         Timber.i(
             "Building sing-box config: servers=%d smart=%s final=%s outbounds=%s",
@@ -77,7 +81,7 @@ class SingBoxConfigBuilder @Inject constructor() {
                 put("level", "info")
                 put("timestamp", true)
             })
-            put("dns", buildDns(finalTag, servers))
+            put("dns", buildDns(finalTag, servers, directDnsForAllDomains))
             putJsonArray("inbounds") {
                 add(buildTunInbound())
                 if (smartSelection) add(buildOptimizerMixedInbound())
@@ -386,11 +390,19 @@ class SingBoxConfigBuilder @Inject constructor() {
         }
     }
 
-    private fun buildDns(finalTag: String, servers: List<Server>): JsonObject = buildJsonObject {
+    private fun buildDns(
+        finalTag: String,
+        servers: List<Server>,
+        directDnsForAllDomains: Boolean,
+    ): JsonObject = buildJsonObject {
         val localDomains = servers.mapNotNull { it.dnsRuleDomain() }.distinct()
+        val dnsFinalTag = if (directDnsForAllDomains) LOCAL_DNS_TAG else REMOTE_DNS_TAG
+        val remoteDetour = if (directDnsForAllDomains) DIRECT_TAG else finalTag
         Timber.i(
-            "Building sing-box DNS: final=%s localDomains=%s remote=%s address=%s local=%s address=%s",
+            "Building sing-box DNS: final=%s dnsFinal=%s directAll=%s localDomains=%s remote=%s address=%s local=%s address=%s",
             finalTag,
+            dnsFinalTag,
+            directDnsForAllDomains,
             localDomains.joinToString(),
             REMOTE_DNS_TAG,
             REMOTE_DNS_ADDRESS,
@@ -401,7 +413,7 @@ class SingBoxConfigBuilder @Inject constructor() {
             addJsonObject {
                 put("tag", REMOTE_DNS_TAG)
                 put("address", REMOTE_DNS_ADDRESS)
-                put("detour", finalTag)
+                put("detour", remoteDetour)
                 put("strategy", "ipv4_only")
             }
             // Local DNS is intentionally NOT `address: "local"`. On Android the Go resolver
@@ -429,7 +441,7 @@ class SingBoxConfigBuilder @Inject constructor() {
                 }
             }
         }
-        put("final", REMOTE_DNS_TAG)
+        put("final", dnsFinalTag)
         put("strategy", "ipv4_only")
         put("disable_cache", false)
     }

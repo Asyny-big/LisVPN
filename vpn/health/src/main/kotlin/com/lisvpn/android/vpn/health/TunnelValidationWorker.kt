@@ -27,7 +27,27 @@ class TunnelValidationWorker @Inject constructor(
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
 ) {
 
-    suspend fun validate(serverId: String): TunnelValidationResult = withContext(ioDispatcher) {
+    suspend fun validate(serverId: String): TunnelValidationResult =
+        validateTargets(
+            serverId = serverId,
+            targets = VALIDATION_TARGETS,
+            requireAllTargets = true,
+        )
+
+    suspend fun validateManual(serverId: String): TunnelValidationResult =
+        // Manual mode should prove the tunnel carries real traffic, not reject a user-picked server
+        // because one public probe endpoint (for example Cloudflare 204) is blocked or slow.
+        validateTargets(
+            serverId = serverId,
+            targets = MANUAL_VALIDATION_TARGETS,
+            requireAllTargets = false,
+        )
+
+    private suspend fun validateTargets(
+        serverId: String,
+        targets: List<ValidationTarget>,
+        requireAllTargets: Boolean,
+    ): TunnelValidationResult = withContext(ioDispatcher) {
         val startedAt = SystemClock.elapsedRealtime()
         val network = waitForVpnNetwork() ?: return@withContext TunnelValidationResult.failed(
             serverId = serverId,
@@ -39,7 +59,7 @@ class TunnelValidationWorker @Inject constructor(
         } == true
 
         val checks = coroutineScope {
-            VALIDATION_TARGETS.map { target ->
+            targets.map { target ->
                 async {
                     withTimeoutOrNull(HTTP_CHECK_TIMEOUT_MS) {
                         checkEndpoint(network, target)
@@ -55,7 +75,8 @@ class TunnelValidationWorker @Inject constructor(
             }.awaitAll()
         }
         val allHttpOk = checks.isNotEmpty() && checks.all { it.success }
-        val eligible = dnsWorks && allHttpOk
+        val anyHttpOk = checks.any { it.success }
+        val eligible = dnsWorks && if (requireAllTargets) allHttpOk else anyHttpOk
         TunnelValidationResult(
             serverId = serverId,
             vpnNetworkSeen = true,
@@ -179,6 +200,15 @@ class TunnelValidationWorker @Inject constructor(
             url = "https://cp.cloudflare.com/generate_204",
             accepts = { it == 204 || it in 200..299 },
         )
+        val TELEGRAM_TARGET = ValidationTarget(
+            name = "telegram",
+            url = "https://telegram.org",
+            accepts = { it in 200..399 },
+        )
+        val MANUAL_VALIDATION_TARGETS = listOf(
+            HEALTH_TARGET,
+            TELEGRAM_TARGET,
+        )
         val VALIDATION_TARGETS = listOf(
             HEALTH_TARGET,
             ValidationTarget(
@@ -186,11 +216,7 @@ class TunnelValidationWorker @Inject constructor(
                 url = "https://1.1.1.1/cdn-cgi/trace",
                 readBody = true,
             ),
-            ValidationTarget(
-                name = "telegram",
-                url = "https://telegram.org",
-                accepts = { it in 200..399 },
-            ),
+            TELEGRAM_TARGET,
             ValidationTarget(
                 name = "youtube",
                 url = "https://www.youtube.com/generate_204",
