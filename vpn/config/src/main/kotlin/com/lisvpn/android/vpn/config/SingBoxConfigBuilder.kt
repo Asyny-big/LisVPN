@@ -312,12 +312,13 @@ class SingBoxConfigBuilder @Inject constructor() {
     private fun buildDns(finalTag: String, servers: List<Server>): JsonObject = buildJsonObject {
         val localDomains = servers.mapNotNull { it.dnsRuleDomain() }.distinct()
         Timber.i(
-            "Building sing-box DNS: final=%s localDomains=%s remote=%s address=%s local=%s",
+            "Building sing-box DNS: final=%s localDomains=%s remote=%s address=%s local=%s address=%s",
             finalTag,
             localDomains.joinToString(),
             REMOTE_DNS_TAG,
             REMOTE_DNS_ADDRESS,
             LOCAL_DNS_TAG,
+            LOCAL_DNS_ADDRESS,
         )
         putJsonArray("servers") {
             addJsonObject {
@@ -326,9 +327,15 @@ class SingBoxConfigBuilder @Inject constructor() {
                 put("detour", finalTag)
                 put("strategy", "ipv4_only")
             }
+            // Local DNS is intentionally NOT `address: "local"`. On Android the Go resolver
+            // backing `local` consults the OS, and the OS hands out the in-tunnel DNS once the
+            // VPN is up - which means resolving the server's own hostname routes the query
+            // through the tunnel that hasn't come up yet. Pinning local DNS to a real DoH
+            // endpoint with `detour: direct` short-circuits that loop and is what lets manual
+            // selection of a hostname-only server (e.g. govchat.ru) actually connect.
             addJsonObject {
                 put("tag", LOCAL_DNS_TAG)
-                put("address", "local")
+                put("address", LOCAL_DNS_ADDRESS)
                 put("detour", DIRECT_TAG)
                 put("strategy", "ipv4_only")
             }
@@ -377,6 +384,7 @@ class SingBoxConfigBuilder @Inject constructor() {
         const val REMOTE_DNS_TAG = "remote"
         const val REMOTE_DNS_ADDRESS = "https://1.1.1.1/dns-query"
         const val LOCAL_DNS_TAG = "local"
+        const val LOCAL_DNS_ADDRESS = "https://8.8.8.8/dns-query"
         const val BLOCK_DNS_TAG = "block"
     }
 }

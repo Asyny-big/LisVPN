@@ -599,9 +599,14 @@ class ProtocolProbe @Inject constructor(
 
     private companion object {
         const val USER_AGENT = "LisVPN/ProtocolProbe"
-        const val TCP_CONNECT_TIMEOUT_MS = 2_500
-        const val TLS_HANDSHAKE_TIMEOUT_MS = 3_500
-        const val HTTP_READ_TIMEOUT_MS = 3_500
+        // Cellular networks and "cold" Wi-Fi paths can spend 2-3s just on the first SYN/SYN-ACK
+        // round-trip after the radio wakes up. The probe used to time out at 2.5s which made
+        // perfectly-healthy servers (e.g. govchat.ru) look broken on the first tap. The values
+        // below are still tight enough to fail dead servers fast but forgiving enough that a
+        // single warmup spike does not block a manual connection.
+        const val TCP_CONNECT_TIMEOUT_MS = 6_000
+        const val TLS_HANDSHAKE_TIMEOUT_MS = 6_000
+        const val HTTP_READ_TIMEOUT_MS = 6_000
         const val HTTP_RESPONSE_LIMIT_BYTES = 4 * 1024
     }
 }

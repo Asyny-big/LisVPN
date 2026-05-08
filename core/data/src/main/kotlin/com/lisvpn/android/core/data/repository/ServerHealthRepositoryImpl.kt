@@ -66,16 +66,10 @@ class ServerHealthRepositoryImpl @Inject constructor(
 
     override suspend fun probe(server: Server): AppResult<HealthSnapshot> {
         return try {
-            val result = withTimeoutOrNull(PROTOCOL_PROBE_TIMEOUT_MS) {
-                protocolProbe.probe(server)
-            } ?: ProtocolProbeResult(
-                snapshot = failedSnapshot(server),
-                downloadedBytes = 0L,
-                downloadMs = null,
-                bytesPerSecond = null,
-            ).also {
-                Timber.w("Manual protocol validation timed out: server=%s timeoutMs=%d", server.displayName, PROTOCOL_PROBE_TIMEOUT_MS)
-            }
+            // Real-world Android networks regularly drop the very first SYN to a fresh server
+            // (radio sleep, captive-portal NAT, etc.). One immediate retry costs ~50 ms when the
+            // server is healthy and saves the user from a confusing "server unreachable" toast.
+            val result = probeWithRetry(server)
             val snapshot = result.snapshot
             record(snapshot)
             if (snapshot.success) {
@@ -104,6 +98,44 @@ class ServerHealthRepositoryImpl @Inject constructor(
             Timber.w(e, "Protocol validation crashed: server=%s", server.displayName)
             AppResult.Failure(AppError.from(e), e)
         }
+    }
+
+    private suspend fun probeWithRetry(server: Server): ProtocolProbeResult {
+        val attempts = MANUAL_PROBE_ATTEMPTS.coerceAtLeast(1)
+        var last: ProtocolProbeResult? = null
+        for (attempt in 1..attempts) {
+            val result = withTimeoutOrNull(PROTOCOL_PROBE_TIMEOUT_MS) {
+                protocolProbe.probe(server)
+            }
+            if (result == null) {
+                Timber.w(
+                    "Manual protocol validation timed out: server=%s attempt=%d/%d timeoutMs=%d",
+                    server.displayName,
+                    attempt,
+                    attempts,
+                    PROTOCOL_PROBE_TIMEOUT_MS,
+                )
+            } else {
+                if (result.snapshot.success) return result
+                last = result
+                Timber.w(
+                    "Manual protocol validation attempt failed: server=%s attempt=%d/%d httpRtt=%s",
+                    server.displayName,
+                    attempt,
+                    attempts,
+                    result.snapshot.httpRttMs,
+                )
+            }
+            if (attempt < attempts) {
+                kotlinx.coroutines.delay(MANUAL_PROBE_RETRY_DELAY_MS)
+            }
+        }
+        return last ?: ProtocolProbeResult(
+            snapshot = failedSnapshot(server),
+            downloadedBytes = 0L,
+            downloadMs = null,
+            bytesPerSecond = null,
+        )
     }
 
     override suspend fun rank(servers: List<Server>, limit: Int): List<Server> = withContext(ioDispatcher) {
@@ -254,6 +286,8 @@ class ServerHealthRepositoryImpl @Inject constructor(
     private companion object {
         const val AUTO_SELECTED_LIMIT = 32
         const val PROTOCOL_PROBE_TIMEOUT_MS = 16_000L
+        const val MANUAL_PROBE_ATTEMPTS = 2
+        const val MANUAL_PROBE_RETRY_DELAY_MS = 250L
         const val MAX_TOTAL_SAMPLES = 500
         const val MAX_SAMPLES_PER_SERVER = 12
         const val MAX_SCORE_PING_MS = 1_500

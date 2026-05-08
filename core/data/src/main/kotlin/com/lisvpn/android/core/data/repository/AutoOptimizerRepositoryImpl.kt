@@ -329,10 +329,15 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
         const val CONNECTED_WAIT_TIMEOUT_MS = 20_000L
         const val POST_CONNECT_WARMUP_MS = 2_000L
         const val CANDIDATE_WARMUP_MS = 700L
-        const val CANDIDATE_PROBE_TIMEOUT_MS = 12_000L
-        const val OPTIMIZER_CANDIDATE_LIMIT = 10
-        const val SPREAD_CANDIDATE_COUNT = 4
-        const val MAX_SCORE_BYTES_PER_SECOND = 3_000_000L
+        // Each in-tunnel probe now downloads ~2 MiB to capture real bandwidth, so we give it
+        // more headroom than the previous 12 s budget allowed.
+        const val CANDIDATE_PROBE_TIMEOUT_MS = 18_000L
+        const val OPTIMIZER_CANDIDATE_LIMIT = 12
+        const val SPREAD_CANDIDATE_COUNT = 5
+        // 50 Mbps is a more realistic upper bound for a fast residential VPN; the old 3 Mbps cap
+        // saturated the throughput component for almost every server, which silently neutralised
+        // its weight in the optimiser score.
+        const val MAX_SCORE_BYTES_PER_SECOND = 6_250_000L
         const val MAX_SCORE_HTTP_RTT_MS = 2_500
         const val MAX_SCORE_DNS_MS = 1_500
         const val MAX_SCORE_STARTUP_MS = 6_000
@@ -486,14 +491,18 @@ private object AutoTunnelProbe {
     private const val CONNECTIVITY_URL = "https://www.gstatic.com/generate_204"
     private const val YOUTUBE_URL = "https://www.youtube.com/generate_204"
     private const val TELEGRAM_URL = "https://telegram.org/"
-    private const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=524288"
-    private const val HTTP_RTT_SAMPLE_COUNT = 1
+    // Pull a 2 MiB chunk so the throughput measurement actually reflects steady-state bandwidth
+    // and not just slow-start. With the 256 KiB chunk we used previously, a fast and a slow tunnel
+    // routinely landed within a couple kbps of each other on cellular, which is exactly the
+    // "the auto-mode does not really test download speed" complaint we're trying to fix.
+    private const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=2097152"
+    private const val HTTP_RTT_SAMPLE_COUNT = 2
     private const val STABILITY_CHECK_COUNT = 1
-    private const val CONNECT_TIMEOUT_MS = 2_500
-    private const val READ_TIMEOUT_MS = 2_500
-    private const val DOWNLOAD_READ_TIMEOUT_MS = 3_500
+    private const val CONNECT_TIMEOUT_MS = 4_000
+    private const val READ_TIMEOUT_MS = 4_000
+    private const val DOWNLOAD_READ_TIMEOUT_MS = 7_000
     private const val BUFFER_SIZE = 16 * 1024
-    private const val MAX_DOWNLOAD_BYTES = 256 * 1024L
+    private const val MAX_DOWNLOAD_BYTES = 2L * 1024L * 1024L
 }
 
 private data class AutoTunnelProbeResult(
