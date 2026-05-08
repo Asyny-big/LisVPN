@@ -10,8 +10,8 @@ import java.util.concurrent.atomic.AtomicReference
  * Process-local handoff between [VpnConnectionController] and [LisVpnService].
  *
  * Some of the data the service needs to do an AUTO-mode connect — most importantly the list of
- * candidate [Server] objects so it can drive [com.lisvpn.android.core.domain.repository.AutoOptimizerRepository.runPreflight]
- * — can't realistically be packed into the Intent extras (Server is a sealed-class hierarchy
+ * candidate [Server] objects so it can run staged in-tunnel validation — can't realistically
+ * be packed into the Intent extras (Server is a sealed-class hierarchy
  * with multiple Outbound / Security / Transport variants and was never designed to be
  * Parcelable). Since the controller and the service always run in the same OS process — they
  * are wired via Hilt Singleton bindings — a plain in-memory handoff is both simpler and safer.

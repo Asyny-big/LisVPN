@@ -12,6 +12,7 @@ dependencies {
     api(project(":core:domain"))
     api(project(":vpn:libbox"))
     implementation(project(":vpn:config"))
+    implementation(project(":vpn:health"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.service)

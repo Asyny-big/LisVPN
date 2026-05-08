@@ -60,15 +60,11 @@ class VpnConnectionController @Inject constructor(
                 _state.value = VpnState.Error(VpnState.Reason.ConfigInvalid, err.message)
             }
             .getOrElse { return Result.failure(it) }
-        // In AUTO mode with multiple candidates we run a pre-VPN speed test (libbox in
-        // SOCKS-only mode, no TUN, all candidates as outbounds) before the real tunnel comes up.
-        // The user sees that progress in the Connecting subtitle so they know the AUTO pick is
-        // grounded in a real download measurement and not just a latency heuristic.
-        val preflightConfigJson = if (smartSelection && servers.size > 1) {
-            runCatching { configAssembler.assemblePreflight(servers, appRules) }
-                .onFailure { err -> Timber.w(err, "Preflight config assembly failed; falling back to direct connect") }
-                .getOrNull()
-        } else null
+        // AUTO selection now happens inside LisVpnService against the real TUN interface. We still
+        // keep the legacy preflight field in VpnStartContext for binary/source compatibility, but do
+        // not build a second headless libbox config anymore.
+        val preflightConfigJson: String? = null
+        val autoValidation = smartSelection && servers.size > 1
         val displayName = if (smartSelection && servers.size > 1) {
             "Авто · ${servers.size} кандидатов"
         } else {
@@ -77,11 +73,11 @@ class VpnConnectionController @Inject constructor(
 
         _state.value = VpnState.Connecting(serverDisplayName = displayName)
         Timber.i(
-            "VPN start requested: servers=%d smart=%s configBytes=%d preflight=%s candidates=%s",
+            "VPN start requested: servers=%d smart=%s configBytes=%d autoValidation=%s candidates=%s",
             servers.size,
             smartSelection,
             configJson.length,
-            preflightConfigJson != null,
+            autoValidation,
             servers.joinToString { it.diagnosticLabel() },
         )
 

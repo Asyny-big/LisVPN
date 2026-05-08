@@ -95,6 +95,10 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
         _status.value = AutoOptimizerStatus.Idle
     }
 
+    override fun report(status: AutoOptimizerStatus) {
+        _status.value = status
+    }
+
     override suspend fun runPreflight(servers: List<Server>): PreflightResult = mutex.withLock {
         withContext(ioDispatcher) {
             // The VPN tunnel is intentionally NOT up while runPreflight is running — libbox is

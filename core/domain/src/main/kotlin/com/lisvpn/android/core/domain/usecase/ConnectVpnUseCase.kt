@@ -21,8 +21,8 @@ import timber.log.Timber
 /**
  * Orchestrates the "Connect" tap:
  *  1. Pull the active profile.
- *  2. In AUTO, pick a stable bootstrap order and optimize inside the running tunnel.
- *  3. Delegate to [VpnRepository.start] with a permission handle supplied by the activity.
+ *  2. In AUTO, pass all compatible general-purpose servers to VpnService.
+ *  3. Let VpnService run fast filtering, real tunnel validation, mini speed test, and failover.
  */
 class ConnectVpnUseCase @Inject constructor(
     private val profileRepository: ProfileRepository,
@@ -56,7 +56,7 @@ class ConnectVpnUseCase @Inject constructor(
             if (generalCandidates.isEmpty()) {
                 return AppResult.Failure(AppError.Vpn("No general-purpose VPN servers in subscription"))
             }
-            val ranked = selectBestServer(generalCandidates, limit = SMART_LIMIT)
+            val ranked = selectBestServer(generalCandidates, limit = generalCandidates.size)
             Timber.i(
                 "Auto connect pipeline: after scoring selectedCount=%d selected=%s",
                 ranked.size,
@@ -129,19 +129,12 @@ class ConnectVpnUseCase @Inject constructor(
             smartSelection,
             selected.size,
         )
+        autoOptimizerRepository.cancel()
         val result = vpnRepository.start(
             servers = selected,
             smartSelection = smartSelection,
             permission = permission,
         )
-        if (result is AppResult.Success) {
-            // The previous behaviour (schedule the in-tunnel optimizer here) was exactly the
-            // "speed test runs after the VPN is already connected" surprise the user reported.
-            // The pre-VPN preflight in LisVpnService is the canonical AUTO speed-test now, so
-            // we deliberately do NOT schedule the post-connect optimizer in smart mode anymore.
-            // We still cancel any leftover optimizer job from a previous session.
-            autoOptimizerRepository.cancel()
-        }
         return result
     }
 
@@ -170,7 +163,6 @@ class ConnectVpnUseCase @Inject constructor(
         UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX.containsMatchIn(this)
 
     private companion object {
-        const val SMART_LIMIT = 32
         val UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX = Regex("([?&])type=(xhttp|splithttp)(&|#|$)", RegexOption.IGNORE_CASE)
     }
 }

@@ -1,0 +1,201 @@
+package com.lisvpn.android.vpn.health
+
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.os.SystemClock
+import com.lisvpn.android.core.common.dispatchers.IoDispatcher
+import dagger.hilt.android.qualifiers.ApplicationContext
+import java.io.BufferedInputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import javax.inject.Inject
+import javax.inject.Singleton
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+
+@Singleton
+class TunnelValidationWorker @Inject constructor(
+    @ApplicationContext private val context: Context,
+    @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
+) {
+
+    suspend fun validate(serverId: String): TunnelValidationResult = withContext(ioDispatcher) {
+        val startedAt = SystemClock.elapsedRealtime()
+        val network = waitForVpnNetwork() ?: return@withContext TunnelValidationResult.failed(
+            serverId = serverId,
+            reason = "vpn network not visible",
+            elapsedMs = elapsedSince(startedAt),
+        )
+        val dnsWorks = withTimeoutOrNull(DNS_TIMEOUT_MS) {
+            runCatching { network.getAllByName(DNS_VALIDATION_HOST).isNotEmpty() }.getOrDefault(false)
+        } == true
+
+        val checks = coroutineScope {
+            VALIDATION_TARGETS.map { target ->
+                async {
+                    withTimeoutOrNull(HTTP_CHECK_TIMEOUT_MS) {
+                        checkEndpoint(network, target)
+                    } ?: ValidationEndpointResult(
+                        name = target.name,
+                        url = target.url,
+                        success = false,
+                        httpCode = null,
+                        elapsedMs = null,
+                        error = "timeout",
+                    )
+                }
+            }.awaitAll()
+        }
+        val allHttpOk = checks.isNotEmpty() && checks.all { it.success }
+        val eligible = dnsWorks && allHttpOk
+        TunnelValidationResult(
+            serverId = serverId,
+            vpnNetworkSeen = true,
+            endpointResults = checks,
+            dnsWorks = dnsWorks,
+            eligible = eligible,
+            elapsedMs = elapsedSince(startedAt),
+            failureReason = if (eligible) null else buildFailureReason(dnsWorks, checks),
+        )
+    }
+
+    suspend fun quickGenerate204(): HealthCheckResult = withContext(ioDispatcher) {
+        val network = findVpnNetwork() ?: return@withContext HealthCheckResult(
+            healthy = false,
+            elapsedMs = null,
+            reason = "vpn network not visible",
+        )
+        val result = withTimeoutOrNull(HEALTH_CHECK_TIMEOUT_MS) {
+            checkEndpoint(network, HEALTH_TARGET)
+        }
+        HealthCheckResult(
+            healthy = result?.success == true,
+            elapsedMs = result?.elapsedMs,
+            reason = result?.error ?: if (result?.success == true) null else "generate_204 failed",
+        )
+    }
+
+    private suspend fun waitForVpnNetwork(): Network? {
+        repeat(VPN_NETWORK_WAIT_ATTEMPTS) {
+            findVpnNetwork()?.let { return it }
+            delay(VPN_NETWORK_WAIT_STEP_MS)
+        }
+        return null
+    }
+
+    private fun findVpnNetwork(): Network? {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        return manager.allNetworks.firstOrNull { network ->
+            val caps = manager.getNetworkCapabilities(network) ?: return@firstOrNull false
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+        }
+    }
+
+    private fun checkEndpoint(network: Network, target: ValidationTarget): ValidationEndpointResult {
+        val startedAt = SystemClock.elapsedRealtime()
+        return runCatching {
+            val connection = (network.openConnection(URL(target.url)) as HttpURLConnection).apply {
+                instanceFollowRedirects = false
+                requestMethod = "GET"
+                connectTimeout = HTTP_CONNECT_TIMEOUT_MS
+                readTimeout = HTTP_READ_TIMEOUT_MS
+                setRequestProperty("User-Agent", USER_AGENT)
+                useCaches = false
+            }
+            try {
+                val code = connection.responseCode
+                if (target.readBody && code in 200..299) {
+                    BufferedInputStream(connection.inputStream).use { input ->
+                        val buffer = ByteArray(256)
+                        input.read(buffer)
+                    }
+                }
+                val success = target.accepts(code)
+                ValidationEndpointResult(
+                    name = target.name,
+                    url = target.url,
+                    success = success,
+                    httpCode = code,
+                    elapsedMs = elapsedSince(startedAt),
+                    error = if (success) null else "http $code",
+                )
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrElse { err ->
+            if (err is CancellationException) throw err
+            ValidationEndpointResult(
+                name = target.name,
+                url = target.url,
+                success = false,
+                httpCode = null,
+                elapsedMs = elapsedSince(startedAt),
+                error = "${err::class.java.simpleName}: ${err.message.orEmpty()}".take(96),
+            )
+        }
+    }
+
+    private fun buildFailureReason(
+        dnsWorks: Boolean,
+        checks: List<ValidationEndpointResult>,
+    ): String {
+        if (!dnsWorks) return "dns validation failed"
+        val failed = checks.filterNot { it.success }
+        return failed.joinToString(limit = 3) { "${it.name}:${it.error ?: it.httpCode}" }
+            .ifBlank { "internet validation failed" }
+    }
+
+    private fun elapsedSince(startedAt: Long): Int =
+        (SystemClock.elapsedRealtime() - startedAt).toInt().coerceAtLeast(1)
+
+    private data class ValidationTarget(
+        val name: String,
+        val url: String,
+        val readBody: Boolean = false,
+        val accepts: (Int) -> Boolean = { it in 200..299 },
+    )
+
+    private companion object {
+        const val USER_AGENT = "LisVPN/TunnelValidation"
+        const val DNS_VALIDATION_HOST = "telegram.org"
+        const val DNS_TIMEOUT_MS = 2_500L
+        const val HTTP_CHECK_TIMEOUT_MS = 5_000L
+        const val HEALTH_CHECK_TIMEOUT_MS = 4_000L
+        const val HTTP_CONNECT_TIMEOUT_MS = 3_000
+        const val HTTP_READ_TIMEOUT_MS = 3_500
+        const val VPN_NETWORK_WAIT_ATTEMPTS = 12
+        const val VPN_NETWORK_WAIT_STEP_MS = 250L
+
+        val HEALTH_TARGET = ValidationTarget(
+            name = "cloudflare204",
+            url = "https://cp.cloudflare.com/generate_204",
+            accepts = { it == 204 || it in 200..299 },
+        )
+        val VALIDATION_TARGETS = listOf(
+            HEALTH_TARGET,
+            ValidationTarget(
+                name = "cloudflareTrace",
+                url = "https://1.1.1.1/cdn-cgi/trace",
+                readBody = true,
+            ),
+            ValidationTarget(
+                name = "telegram",
+                url = "https://telegram.org",
+                accepts = { it in 200..399 },
+            ),
+            ValidationTarget(
+                name = "youtube",
+                url = "https://www.youtube.com/generate_204",
+                accepts = { it == 204 || it in 200..399 },
+            ),
+        )
+    }
+}

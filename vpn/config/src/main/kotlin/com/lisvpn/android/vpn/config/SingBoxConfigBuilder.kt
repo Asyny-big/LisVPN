@@ -98,17 +98,9 @@ class SingBoxConfigBuilder @Inject constructor() {
     }
 
     /**
-     * Builds a *headless* sing-box config used during the AUTO mode pre-VPN speed test.
-     *
-     * The user's expectation in AUTO mode is that we measure each candidate's download speed
-     * directly from their current network — not from inside an already-established VPN tunnel.
-     * To do that we run libbox in SOCKS-only mode: no `tun` inbound, only the SOCKS5 mixed
-     * inbound on `127.0.0.1:[OPTIMIZER_SOCKS_PORT]`. Because no TUN is opened, the user's apps
-     * keep using their normal network unchanged; meanwhile the speed-test loop in
-     * [com.lisvpn.android.core.data.repository.AutoOptimizerRepositoryImpl] dials the SOCKS port
-     * once per candidate and downloads a 2 MiB chunk through that candidate's VLESS / Reality
-     * outbound, which is exactly the "пингую сервер напрямую с моей сети" semantic the user
-     * asked for.
+     * Legacy headless config for the old SOCKS-only AUTO preflight. The production AUTO path now
+     * uses the real TUN interface so a server is never marked eligible until HTTP validation passes
+     * through Android's VPN network.
      *
      * The selector tag is the same [OPTIMIZER_SELECTOR_TAG] used by the post-connect optimizer
      * so the existing `selectOutbound("auto-optimizer", "srv-N")` plumbing works unchanged.

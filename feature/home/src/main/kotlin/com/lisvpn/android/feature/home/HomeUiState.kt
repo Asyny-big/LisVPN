@@ -27,11 +27,8 @@ data class HomeUiState(
 
     fun withOptimizerStatus(status: AutoOptimizerUiStatus): HomeUiState {
         if (status == optimizer) return this
-        // We overlay a subtitle line whenever the AutoOptimizerRepository has something to
-        // report, regardless of whether the VPN is currently in Connecting (pre-VPN preflight
-        // speed test) or Connected (legacy in-tunnel optimizer). Pre-VPN preflight is the
-        // actual primary surface now — the user wanted to *see* the speed test happen before
-        // the tunnel comes up.
+        // We overlay a subtitle line whenever AUTO is filtering, validating or speed-testing
+        // candidates through the live tunnel.
         val statusLine = status.toSubtitleLine()
         val nextSubtitle = if (statusLine != null &&
             (orb == StatusOrbState.Connecting || orb == StatusOrbState.Connected)
@@ -157,10 +154,8 @@ data class HomeServerOption(
 )
 
 /**
- * Lightweight UI projection of the in-tunnel optimizer's progress so the Home screen can show
- * the user that we are *actually* download-speed-testing each candidate server through the
- * tunnel — previously the optimiser ran silently in the background and the user reasonably
- * concluded that no real speed test ever happened.
+ * Lightweight UI projection of AUTO progress so the Home screen can show real server validation
+ * and mini speed-test progress instead of an opaque "Connecting" state.
  */
 sealed interface AutoOptimizerUiStatus {
     data object Idle : AutoOptimizerUiStatus

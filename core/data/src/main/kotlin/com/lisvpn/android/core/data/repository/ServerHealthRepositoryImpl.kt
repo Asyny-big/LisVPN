@@ -143,7 +143,7 @@ class ServerHealthRepositoryImpl @Inject constructor(
 
         val candidates = servers.filter { it.isGeneralVpnEligible() }
         val excludedSpecial = servers.size - candidates.size
-        val selectedLimit = limit.coerceAtMost(AUTO_SELECTED_LIMIT).coerceAtMost(candidates.size)
+        val selectedLimit = limit.coerceAtMost(candidates.size)
         if (candidates.isEmpty()) {
             Timber.w(
                 "Auto bootstrap plan skipped: total=%d excludedSpecial=%d",

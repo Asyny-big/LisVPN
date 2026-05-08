@@ -17,9 +17,23 @@ import com.lisvpn.android.core.domain.model.ConnectedServer
 import com.lisvpn.android.core.domain.model.VpnState
 import com.lisvpn.android.core.domain.repository.AppRulesRepository
 import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
+import com.lisvpn.android.core.domain.repository.AutoOptimizerStatus
 import com.lisvpn.android.vpn.libbox.LibboxBridge
+import com.lisvpn.android.vpn.health.AutoFailoverManager
+import com.lisvpn.android.vpn.health.AutoFailoverSwitchController
+import com.lisvpn.android.vpn.health.AutoSelectionCandidate
+import com.lisvpn.android.vpn.health.FastProbeResult
+import com.lisvpn.android.vpn.health.FastProbeWorker
+import com.lisvpn.android.vpn.health.ScoreCalculator
+import com.lisvpn.android.vpn.health.ScoredAutoServer
+import com.lisvpn.android.vpn.health.SmartNetworkProfile
+import com.lisvpn.android.vpn.health.SmartServerCache
+import com.lisvpn.android.vpn.health.TaggedServer
+import com.lisvpn.android.vpn.health.ThroughputWorker
+import com.lisvpn.android.vpn.health.TunnelValidationWorker
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Job
@@ -29,6 +43,8 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlin.random.Random
@@ -42,16 +58,24 @@ class LisVpnService : VpnService() {
     @Inject lateinit var appRulesRepository: AppRulesRepository
     @Inject lateinit var startContext: VpnStartContext
     @Inject lateinit var autoOptimizerRepository: AutoOptimizerRepository
+    @Inject lateinit var fastProbeWorker: FastProbeWorker
+    @Inject lateinit var tunnelValidationWorker: TunnelValidationWorker
+    @Inject lateinit var throughputWorker: ThroughputWorker
+    @Inject lateinit var scoreCalculator: ScoreCalculator
+    @Inject lateinit var smartServerCache: SmartServerCache
+    @Inject lateinit var autoFailoverManager: AutoFailoverManager
     @Inject @IoDispatcher lateinit var ioDispatcher: CoroutineDispatcher
 
     private var serviceScope: CoroutineScope? = null
     private var bridge: LibboxBridge? = null
     private var startJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val reconnectMutex = Mutex()
     private var activeServer: ConnectedServer? = null
     private var connectedAt: Instant? = null
     private var reconnectAttempt: Int = 0
     private var reconnectWakeJob: Job? = null
+    private var failoverJob: Job? = null
     private var sleepingForNetwork: Boolean = false
 
     override fun onCreate() {
@@ -104,56 +128,24 @@ class LisVpnService : VpnService() {
             val rules = pending?.appRules
                 ?: runCatching { appRulesRepository.observe().first() }.getOrDefault(AppRules.Default)
 
-            // ----------------------------------------------------------
-            // AUTO mode preflight (pre-VPN speed test) — runs only when
-            // we have a multi-candidate AUTO start. Libbox is brought up in
-            // headless / SOCKS-only mode (no TUN), so the user's apps keep
-            // using the regular network while we measure each candidate.
-            // ----------------------------------------------------------
-            var winnerOutboundTag: String? = null
-            val preflightConfigJson = pending?.preflightConfigJson
-            val preflightCandidates = pending?.candidates.orEmpty()
-            val shouldRunPreflight =
-                pending != null &&
-                    pending.smartSelection &&
-                    !preflightConfigJson.isNullOrBlank() &&
-                    preflightCandidates.size > 1
-            if (shouldRunPreflight) {
-                val preflightBridge = LibboxBridge(
-                    service = this@LisVpnService,
-                    configJson = preflightConfigJson!!,
-                    appRules = rules,
-                )
-                bridge = preflightBridge
-                Timber.i("Preflight libbox: validate")
-                val preflightValidation = preflightBridge.validate()
-                if (preflightValidation.isFailure) {
-                    Timber.e(preflightValidation.exceptionOrNull(), "Preflight config validation failed; skipping preflight")
-                } else {
-                    Timber.i("Preflight libbox: start")
-                    val preflightStart = preflightBridge.start()
-                    if (preflightStart.isFailure) {
-                        Timber.e(preflightStart.exceptionOrNull(), "Preflight libbox start failed; skipping preflight")
-                    } else {
-                        val preflight = runCatching {
-                            autoOptimizerRepository.runPreflight(preflightCandidates)
-                        }
-                        preflight
-                            .onSuccess { result ->
-                                winnerOutboundTag = result.winnerOutboundTag
-                                Timber.i(
-                                    "Preflight finished: winnerTag=%s tested=%d speedKbps=%s",
-                                    result.winnerOutboundTag,
-                                    result.tested,
-                                    result.winnerSpeedKbps,
-                                )
-                            }
-                            .onFailure { Timber.e(it, "Preflight runPreflight() failed") }
-                    }
+            val autoCandidates = pending?.candidates.orEmpty()
+            val shouldRunAutoValidation = pending?.smartSelection == true && autoCandidates.size > 1
+            val autoPlan = if (shouldRunAutoValidation) {
+                try {
+                    buildAutoSelectionPlan(autoCandidates)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    Timber.e(e, "AUTO fast filter crashed")
+                    null
                 }
-                Timber.i("Preflight libbox: stop")
-                preflightBridge.stop()
-                bridge = null
+            } else {
+                null
+            }
+            if (shouldRunAutoValidation && autoPlan == null) {
+                controller.publishError(VpnState.Reason.NetworkUnavailable, "No reachable AUTO candidates")
+                stopSelfCleanly()
+                return@launch
             }
 
             // ----------------------------------------------------------
@@ -182,20 +174,31 @@ class LisVpnService : VpnService() {
                 stopSelfCleanly()
                 return@launch
             }
-            // Apply the preflight winner to the real tunnel's `auto` selector. The selector
-            // group is created with `outbounds.first()` as the default — we override it here
-            // so that the connected user actually goes through the candidate the preflight
-            // measured to be fastest, not just the first server in the bootstrap-ranked list.
-            val winnerTag = winnerOutboundTag
-            if (winnerTag != null) {
-                Timber.i("Applying preflight winner to auto selector: outbound=%s", winnerTag)
-                newBridge.selectOutbound(AUTO_SELECTOR_TAG, winnerTag)
-                    .onFailure { Timber.w(it, "Failed to apply preflight winner to auto selector") }
+            val autoResult = if (autoPlan != null) {
+                try {
+                    runAutoTunnelValidation(newBridge, autoPlan)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    Timber.e(e, "AUTO tunnel validation crashed")
+                    null
+                }
+            } else {
+                null
             }
+            if (autoPlan != null && autoResult == null) {
+                Timber.w("AUTO start aborted: no candidate passed real tunnel validation")
+                newBridge.stop()
+                bridge = null
+                controller.publishError(VpnState.Reason.StartFailed, "No AUTO server has working internet on this network")
+                stopSelfCleanly()
+                return@launch
+            }
+            val selectedServer = autoResult?.best?.server ?: pending?.candidates?.firstOrNull()
             val cs = ConnectedServer(
-                serverId = serverLabel.orEmpty(),
-                displayName = winnerDisplayNameOrFallback(winnerTag, pending) ?: serverLabel ?: "Авто",
-                countryCode = null,
+                serverId = selectedServer?.id ?: serverLabel.orEmpty(),
+                displayName = selectedServer?.displayName ?: serverLabel ?: "Авто",
+                countryCode = selectedServer?.countryCode,
             )
             val now = Clock.System.now()
             activeServer = cs
@@ -204,17 +207,199 @@ class LisVpnService : VpnService() {
             registerNetworkCallback()
             controller.publishConnected(cs, now)
             updateNotification(VpnState.Connected(cs, now))
+            autoResult?.let { startAutoFailover(it) }
         }
     }
 
-    private fun winnerDisplayNameOrFallback(
-        winnerTag: String?,
-        pending: VpnStartContext.Pending?,
-    ): String? {
-        if (winnerTag == null || pending == null) return null
-        val index = winnerTag.removePrefix("srv-").toIntOrNull() ?: return null
-        return pending.candidates.getOrNull(index)?.displayName
+    private suspend fun buildAutoSelectionPlan(candidates: List<com.lisvpn.android.core.domain.model.Server>): AutoSelectionPlan? {
+        val profile = smartServerCache.currentProfile()
+        val tagged = candidates.mapIndexed { index, server -> TaggedServer(server, "srv-$index") }
+        autoOptimizerRepository.report(
+            AutoOptimizerStatus.Probing(
+                current = 1,
+                total = tagged.size,
+                serverDisplayName = "Быстрый фильтр всех серверов",
+            ),
+        )
+        val histories = smartServerCache.histories(profile, tagged.map { it.server.id })
+        val fastResults = fastProbeWorker.probeAll(tagged)
+        val shortlist = scoreCalculator.shortlist(
+            fastResults = fastResults,
+            histories = histories,
+            profile = profile,
+            limit = AUTO_SHORTLIST_LIMIT,
+        )
+        Timber.i(
+            "AUTO stage1 fast filter: network=%s fingerprint=%s total=%d reachable=%d shortlist=%s failures=%s",
+            profile.networkClass,
+            profile.fingerprint,
+            tagged.size,
+            fastResults.count { it.success },
+            shortlist.joinToString { "${it.server.displayName}/${it.fastProbe.latencyMs}ms" },
+            fastResults.filterNot { it.success }.take(6).joinToString { "${it.taggedServer.server.displayName}:${it.failureReason}" },
+        )
+        if (shortlist.isEmpty()) {
+            autoOptimizerRepository.report(AutoOptimizerStatus.Failed("no reachable servers"))
+            return null
+        }
+        return AutoSelectionPlan(profile = profile, shortlist = shortlist, fastResults = fastResults)
     }
+
+    private suspend fun runAutoTunnelValidation(
+        runningBridge: LibboxBridge,
+        plan: AutoSelectionPlan,
+    ): AutoSelectionResult? {
+        val scored = mutableListOf<ScoredAutoServer>()
+        var lastSuccessful: ScoredAutoServer? = null
+        for ((index, candidate) in plan.shortlist.withIndex()) {
+            autoOptimizerRepository.report(
+                AutoOptimizerStatus.Probing(
+                    current = index + 1,
+                    total = plan.shortlist.size,
+                    serverDisplayName = candidate.server.displayName,
+                    lastSpeedKbps = lastSuccessful?.throughput?.kbps,
+                    lastServerDisplayName = lastSuccessful?.server?.displayName,
+                ),
+            )
+            val switched = runningBridge.selectOutbound(AUTO_SELECTOR_TAG, candidate.outboundTag)
+            if (switched.isFailure) {
+                val failedValidation = com.lisvpn.android.vpn.health.TunnelValidationResult.failed(
+                    serverId = candidate.server.id,
+                    reason = "selector switch failed",
+                )
+                val failed = ScoredAutoServer(
+                    candidate = candidate,
+                    validation = failedValidation,
+                    throughput = null,
+                    score = scoreCalculator.score(candidate, failedValidation, null, plan.profile),
+                )
+                scored += failed
+                smartServerCache.record(plan.profile, failed)
+                Timber.w(switched.exceptionOrNull(), "AUTO candidate skipped: selector switch failed server=%s", candidate.server.displayName)
+                continue
+            }
+            delay(if (index == 0) FIRST_SELECTOR_SWITCH_WARMUP_MS else SELECTOR_SWITCH_WARMUP_MS)
+            val validation = tunnelValidationWorker.validate(candidate.server.id)
+            val throughput = if (validation.eligible) throughputWorker.measure() else null
+            val score = scoreCalculator.score(candidate, validation, throughput, plan.profile)
+            val current = ScoredAutoServer(
+                candidate = candidate,
+                validation = validation,
+                throughput = throughput,
+                score = score,
+            )
+            scored += current
+            smartServerCache.record(plan.profile, current)
+            if (validation.eligible) lastSuccessful = current
+            Timber.i(
+                "AUTO stage2/3 candidate: server=%s tag=%s eligible=%s score=%d speedKbps=%s http=%d/%d rtt=%sms jitter=%sms loss=%.2f reason=%s",
+                candidate.server.displayName,
+                candidate.outboundTag,
+                validation.eligible,
+                scoreCalculator.diagnosticScore(score),
+                throughput?.kbps,
+                validation.successCount,
+                validation.checkCount,
+                validation.averageRttMs,
+                validation.jitterMs,
+                validation.packetLossApprox,
+                validation.failureReason,
+            )
+        }
+
+        val validated = scored
+            .filter { it.eligible }
+            .sortedWith(
+                compareByDescending<ScoredAutoServer> { it.score }
+                    .thenByDescending { it.throughput?.mbps ?: 0.0 }
+                    .thenBy { it.validation.averageRttMs ?: Int.MAX_VALUE },
+            )
+        val best = validated.firstOrNull()
+        if (best == null) {
+            autoOptimizerRepository.report(AutoOptimizerStatus.Failed("no server with working internet"))
+            return null
+        }
+        runningBridge.selectOutbound(AUTO_SELECTOR_TAG, best.outboundTag)
+            .onFailure { Timber.w(it, "Failed to switch AUTO selector to validated winner") }
+        autoOptimizerRepository.report(
+            AutoOptimizerStatus.Done(
+                bestServerDisplayName = best.server.displayName,
+                bestSpeedKbps = best.throughput?.kbps,
+                tested = scored.size,
+            ),
+        )
+        Timber.i(
+            "AUTO selection finished: best=%s tag=%s score=%d validated=%d tested=%d speedKbps=%s",
+            best.server.displayName,
+            best.outboundTag,
+            scoreCalculator.diagnosticScore(best.score),
+            validated.size,
+            scored.size,
+            best.throughput?.kbps,
+        )
+        return AutoSelectionResult(profile = plan.profile, best = best, validated = validated)
+    }
+
+    private fun startAutoFailover(result: AutoSelectionResult) {
+        failoverJob?.cancel()
+        val scope = serviceScope ?: return
+        failoverJob = autoFailoverManager.start(
+            scope = scope,
+            profile = result.profile,
+            validatedServers = result.validated,
+            initialOutboundTag = result.best.outboundTag,
+            switchController = object : AutoFailoverSwitchController {
+                override suspend fun switchTo(outboundTag: String): Boolean = reconnectMutex.withLock {
+                    val runningBridge = bridge ?: return@withLock false
+                    runningBridge.selectOutbound(AUTO_SELECTOR_TAG, outboundTag).isSuccess
+                }
+
+                override suspend fun onFailoverStarted(attempt: Int, fromServerDisplayName: String?) {
+                    reconnectAttempt = attempt
+                    val state = VpnState.Reconnecting(attempt, fromServerDisplayName)
+                    controller.publishReconnecting(attempt)
+                    updateNotification(state)
+                }
+
+                override suspend fun onFailoverSucceeded(
+                    server: com.lisvpn.android.core.domain.model.Server,
+                    outboundTag: String,
+                ) {
+                    val connectedServer = ConnectedServer(
+                        serverId = server.id,
+                        displayName = server.displayName,
+                        countryCode = server.countryCode,
+                    )
+                    activeServer = connectedServer
+                    val now = Clock.System.now()
+                    connectedAt = now
+                    reconnectAttempt = 0
+                    sleepingForNetwork = false
+                    controller.publishConnected(connectedServer, now)
+                    updateNotification(VpnState.Connected(connectedServer, now))
+                    Timber.i("AUTO failover published connected: server=%s tag=%s", server.displayName, outboundTag)
+                }
+
+                override suspend fun onFailoverExhausted(reason: String) {
+                    Timber.w("AUTO failover exhausted: %s", reason)
+                    controller.publishError(VpnState.Reason.NetworkUnavailable, reason)
+                    updateNotification(VpnState.Error(VpnState.Reason.NetworkUnavailable, reason))
+                }
+            },
+        )
+    }
+
+    private data class AutoSelectionPlan(
+        val profile: SmartNetworkProfile,
+        val shortlist: List<AutoSelectionCandidate>,
+        val fastResults: List<FastProbeResult>,
+    )
+
+    private data class AutoSelectionResult(
+        val profile: SmartNetworkProfile,
+        val best: ScoredAutoServer,
+        val validated: List<ScoredAutoServer>,
+    )
 
     private fun handleStop() {
         Timber.i("LisVpnService.handleStop")
@@ -231,27 +416,29 @@ class LisVpnService : VpnService() {
 
     private fun handleReconnect() {
         serviceScope?.launch {
-            val runningBridge = bridge
-            if (runningBridge == null || !runningBridge.isRunning()) {
-                controller.publishError(VpnState.Reason.StartFailed, "VPN engine is not running")
-                stopSelfCleanly()
-                return@launch
-            }
-            reconnectAttempt += 1
-            val reconnecting = VpnState.Reconnecting(reconnectAttempt, activeServer?.displayName)
-            Timber.i("Manual VPN reconnect requested: attempt=%d", reconnectAttempt)
-            reconnectWakeJob?.cancel()
-            sleepingForNetwork = false
-            controller.publishReconnecting(reconnectAttempt)
-            updateNotification(reconnecting)
-            runningBridge.sleep()
-            delay(RECONNECT_WAKE_DELAY_MS)
-            runningBridge.wake()
-                .onSuccess { publishConnectedAgain() }
-                .onFailure { err ->
-                    Timber.e(err, "libbox manual wake failed")
-                    controller.publishError(VpnState.Reason.StartFailed, err.message)
+            reconnectMutex.withLock {
+                val runningBridge = bridge
+                if (runningBridge == null || !runningBridge.isRunning()) {
+                    controller.publishError(VpnState.Reason.StartFailed, "VPN engine is not running")
+                    stopSelfCleanly()
+                    return@launch
                 }
+                reconnectAttempt += 1
+                val reconnecting = VpnState.Reconnecting(reconnectAttempt, activeServer?.displayName)
+                Timber.i("Manual VPN reconnect requested: attempt=%d", reconnectAttempt)
+                reconnectWakeJob?.cancel()
+                sleepingForNetwork = false
+                controller.publishReconnecting(reconnectAttempt)
+                updateNotification(reconnecting)
+                runningBridge.sleep()
+                delay(RECONNECT_WAKE_DELAY_MS)
+                runningBridge.wake()
+                    .onSuccess { publishConnectedAgain() }
+                    .onFailure { err ->
+                        Timber.e(err, "libbox manual wake failed")
+                        controller.publishError(VpnState.Reason.StartFailed, err.message)
+                    }
+            }
         }
     }
 
@@ -263,14 +450,16 @@ class LisVpnService : VpnService() {
             return
         }
         serviceScope?.launch {
-            val runningBridge = bridge
-            if (runningBridge == null || !runningBridge.isRunning()) {
-                Timber.w("Outbound switch ignored: libbox is not running group=%s outbound=%s", groupTag, outboundTag)
-                return@launch
+            reconnectMutex.withLock {
+                val runningBridge = bridge
+                if (runningBridge == null || !runningBridge.isRunning()) {
+                    Timber.w("Outbound switch ignored: libbox is not running group=%s outbound=%s", groupTag, outboundTag)
+                    return@launch
+                }
+                runningBridge.selectOutbound(groupTag, outboundTag)
+                    .onSuccess { Timber.i("Outbound switch applied: group=%s outbound=%s", groupTag, outboundTag) }
+                    .onFailure { Timber.e(it, "Outbound switch failed: group=%s outbound=%s", groupTag, outboundTag) }
             }
-            runningBridge.selectOutbound(groupTag, outboundTag)
-                .onSuccess { Timber.i("Outbound switch applied: group=%s outbound=%s", groupTag, outboundTag) }
-                .onFailure { Timber.e(it, "Outbound switch failed: group=%s outbound=%s", groupTag, outboundTag) }
         }
     }
 
@@ -291,10 +480,12 @@ class LisVpnService : VpnService() {
         Timber.d("LisVpnService.onDestroy")
         startJob?.cancel()
         reconnectWakeJob?.cancel()
+        failoverJob?.cancel()
         unregisterNetworkCallback()
         runCatching { kotlinx.coroutines.runBlocking { bridge?.stop() } }
         bridge = null
         startJob = null
+        failoverJob = null
         serviceScope?.cancel()
         serviceScope = null
         super.onDestroy()
@@ -365,6 +556,8 @@ class LisVpnService : VpnService() {
 
     private suspend fun resetRuntime() {
         unregisterNetworkCallback()
+        failoverJob?.cancelAndJoin()
+        failoverJob = null
         reconnectWakeJob?.cancelAndJoin()
         reconnectWakeJob = null
         bridge?.stop()
@@ -464,6 +657,9 @@ class LisVpnService : VpnService() {
         const val RECONNECT_MAX_DELAY_MS = 30_000L
         const val RECONNECT_JITTER_MS = 1_500L
         const val RECONNECT_MAX_EXPONENT = 5
+        const val AUTO_SHORTLIST_LIMIT = 8
+        const val FIRST_SELECTOR_SWITCH_WARMUP_MS = 1_800L
+        const val SELECTOR_SWITCH_WARMUP_MS = 1_000L
         // Mirrors com.lisvpn.android.vpn.config.SingBoxConfigBuilder.AUTO_TAG. Kept private over
         // there to keep the builder's surface tight; here it's just the wire string we hand back
         // to libbox via selectOutbound().
