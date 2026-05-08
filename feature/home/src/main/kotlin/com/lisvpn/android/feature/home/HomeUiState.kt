@@ -27,11 +27,15 @@ data class HomeUiState(
 
     fun withOptimizerStatus(status: AutoOptimizerUiStatus): HomeUiState {
         if (status == optimizer) return this
-        // The orb / canConnect / canDisconnect are already determined by the underlying VPN
-        // state. We only ever overlay a subtitle line so the user can see the speed test
-        // progressing while the VPN reports "Connected".
+        // We overlay a subtitle line whenever the AutoOptimizerRepository has something to
+        // report, regardless of whether the VPN is currently in Connecting (pre-VPN preflight
+        // speed test) or Connected (legacy in-tunnel optimizer). Pre-VPN preflight is the
+        // actual primary surface now — the user wanted to *see* the speed test happen before
+        // the tunnel comes up.
         val statusLine = status.toSubtitleLine()
-        val nextSubtitle = if (statusLine != null && orb == StatusOrbState.Connected) {
+        val nextSubtitle = if (statusLine != null &&
+            (orb == StatusOrbState.Connecting || orb == StatusOrbState.Connected)
+        ) {
             statusLine
         } else {
             subtitle

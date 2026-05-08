@@ -74,7 +74,7 @@ class SingBoxConfigBuilder @Inject constructor() {
 
         val root = buildJsonObject {
             put("log", buildJsonObject {
-                put("level", "warn")
+                put("level", "info")
                 put("timestamp", true)
             })
             put("dns", buildDns(finalTag, servers))
@@ -93,6 +93,57 @@ class SingBoxConfigBuilder @Inject constructor() {
                 }
             }
             put("route", buildRoute(finalTag, optimizerEnabled = includeSelector))
+        }
+        return json.encodeToString(JsonObject.serializer(), root)
+    }
+
+    /**
+     * Builds a *headless* sing-box config used during the AUTO mode pre-VPN speed test.
+     *
+     * The user's expectation in AUTO mode is that we measure each candidate's download speed
+     * directly from their current network — not from inside an already-established VPN tunnel.
+     * To do that we run libbox in SOCKS-only mode: no `tun` inbound, only the SOCKS5 mixed
+     * inbound on `127.0.0.1:[OPTIMIZER_SOCKS_PORT]`. Because no TUN is opened, the user's apps
+     * keep using their normal network unchanged; meanwhile the speed-test loop in
+     * [com.lisvpn.android.core.data.repository.AutoOptimizerRepositoryImpl] dials the SOCKS port
+     * once per candidate and downloads a 2 MiB chunk through that candidate's VLESS / Reality
+     * outbound, which is exactly the "пингую сервер напрямую с моей сети" semantic the user
+     * asked for.
+     *
+     * The selector tag is the same [OPTIMIZER_SELECTOR_TAG] used by the post-connect optimizer
+     * so the existing `selectOutbound("auto-optimizer", "srv-N")` plumbing works unchanged.
+     */
+    fun buildPreflight(
+        servers: List<Server>,
+        @Suppress("UNUSED_PARAMETER") appRules: AppRules,
+    ): String {
+        require(servers.isNotEmpty()) { "Cannot build preflight config without servers" }
+        val outboundTags = servers.indices.map { index -> "srv-$index" }
+        check(outboundTags.distinct().size == outboundTags.size) { "Generated duplicate outbound tags" }
+        Timber.i(
+            "Building sing-box preflight config: servers=%d default=%s outbounds=%s",
+            servers.size,
+            outboundTags.first(),
+            servers.joinToString { it.diagnosticLabel() },
+        )
+
+        val root = buildJsonObject {
+            put("log", buildJsonObject {
+                put("level", "info")
+                put("timestamp", true)
+            })
+            put("dns", buildPreflightDns())
+            putJsonArray("inbounds") {
+                add(buildOptimizerMixedInbound())
+            }
+            putJsonArray("outbounds") {
+                add(directOutbound())
+                add(blockOutbound())
+                add(dnsOutbound())
+                servers.forEachIndexed { i, srv -> add(buildServerOutbound(srv, outboundTags[i])) }
+                add(buildOptimizerSelectorOutbound(outboundTags))
+            }
+            put("route", buildPreflightRoute())
         }
         return json.encodeToString(JsonObject.serializer(), root)
     }
@@ -270,6 +321,40 @@ class SingBoxConfigBuilder @Inject constructor() {
     }
 
     // ---- Route & DNS -------------------------------------------------------
+
+    private fun buildPreflightRoute(): JsonObject = buildJsonObject {
+        put("auto_detect_interface", true)
+        put("override_android_vpn", true)
+        // Preflight has no TUN inbound; the only inbound is the SOCKS5 mixed proxy used by the
+        // speed-test loop. We therefore route every accepted connection straight to the per-server
+        // selector. The DNS / QUIC / LAN guards used for the real tunnel are intentionally
+        // omitted — the speed-test traffic is already destined for known speed-test endpoints.
+        put("final", OPTIMIZER_SELECTOR_TAG)
+        putJsonArray("rules") {
+            addJsonObject {
+                putJsonArray("inbound") { add(OPTIMIZER_INBOUND_TAG) }
+                put("outbound", OPTIMIZER_SELECTOR_TAG)
+            }
+        }
+    }
+
+    private fun buildPreflightDns(): JsonObject = buildJsonObject {
+        // The OkHttp / HttpURLConnection client used by the preflight probe resolves DNS itself
+        // (Java's SOCKS5 stack does client-side DNS), so libbox does not need a working DNS for
+        // the speed-test endpoints. We still wire a cloud DoH server because libbox refuses to
+        // start without at least one DNS server.
+        putJsonArray("servers") {
+            addJsonObject {
+                put("tag", REMOTE_DNS_TAG)
+                put("address", REMOTE_DNS_ADDRESS)
+                put("detour", DIRECT_TAG)
+                put("strategy", "ipv4_only")
+            }
+        }
+        put("final", REMOTE_DNS_TAG)
+        put("strategy", "ipv4_only")
+        put("disable_cache", false)
+    }
 
     private fun buildRoute(finalTag: String, optimizerEnabled: Boolean): JsonObject = buildJsonObject {
         put("auto_detect_interface", true)

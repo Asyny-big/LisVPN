@@ -110,11 +110,12 @@ class ConnectVpnUseCase @Inject constructor(
             permission = permission,
         )
         if (result is AppResult.Success) {
-            if (smartSelection) {
-                autoOptimizerRepository.schedule(selected)
-            } else {
-                autoOptimizerRepository.cancel()
-            }
+            // The previous behaviour (schedule the in-tunnel optimizer here) was exactly the
+            // "speed test runs after the VPN is already connected" surprise the user reported.
+            // The pre-VPN preflight in LisVpnService is the canonical AUTO speed-test now, so
+            // we deliberately do NOT schedule the post-connect optimizer in smart mode anymore.
+            // We still cancel any leftover optimizer job from a previous session.
+            autoOptimizerRepository.cancel()
         }
         return result
     }

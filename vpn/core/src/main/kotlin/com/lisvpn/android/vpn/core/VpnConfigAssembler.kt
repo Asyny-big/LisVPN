@@ -19,4 +19,13 @@ class VpnConfigAssembler @Inject constructor(
         smartSelection: Boolean,
         appRules: AppRules,
     ): String = builder.build(servers = servers, smartSelection = smartSelection, appRules = appRules)
+
+    /**
+     * Builds the headless config that powers the AUTO mode pre-VPN speed test (no TUN, only the
+     * SOCKS5 mixed inbound). See [SingBoxConfigBuilder.buildPreflight] for details.
+     */
+    fun assemblePreflight(
+        servers: List<Server>,
+        appRules: AppRules,
+    ): String = builder.buildPreflight(servers = servers, appRules = appRules)
 }

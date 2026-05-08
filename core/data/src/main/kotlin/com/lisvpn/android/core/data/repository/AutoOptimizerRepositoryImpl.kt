@@ -9,6 +9,7 @@ import com.lisvpn.android.core.domain.model.VpnState
 import com.lisvpn.android.core.domain.model.isGeneralVpnEligible
 import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
 import com.lisvpn.android.core.domain.repository.AutoOptimizerStatus
+import com.lisvpn.android.core.domain.repository.PreflightResult
 import com.lisvpn.android.core.domain.repository.ServerHealthRepository
 import com.lisvpn.android.core.domain.repository.VpnRepository
 import java.io.BufferedInputStream
@@ -83,6 +84,133 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
         optimizerJob?.cancel()
         optimizerJob = null
         _status.value = AutoOptimizerStatus.Idle
+    }
+
+    override suspend fun runPreflight(servers: List<Server>): PreflightResult = mutex.withLock {
+        withContext(ioDispatcher) {
+            // The VPN tunnel is intentionally NOT up while runPreflight is running — libbox is
+            // started in headless / SOCKS-only mode by LisVpnService and the user's apps still
+            // see the regular network. We measure each candidate's *real* download speed by
+            // pulling a 2 MiB chunk over the SOCKS5 proxy via that candidate's outbound, which
+            // is what the user expected the AUTO mode "speed test" to actually be.
+            if (servers.isEmpty()) {
+                Timber.w("Preflight skipped: no servers")
+                _status.value = AutoOptimizerStatus.Failed("no servers")
+                return@withContext PreflightResult(null, null, null, 0)
+            }
+            val profile = autoServerPreferenceStore.currentProfile()
+            val indexedServers = servers.mapIndexed { index, server ->
+                OptimizationCandidate(server, "srv-$index")
+            }.filter { it.server.isGeneralVpnEligible() }
+            if (indexedServers.isEmpty()) {
+                Timber.w("Preflight skipped: no general-purpose candidates")
+                _status.value = AutoOptimizerStatus.Failed("no candidates")
+                return@withContext PreflightResult(null, null, null, 0)
+            }
+            val candidates = indexedServers.take(PREFLIGHT_CANDIDATE_LIMIT)
+            val totalToTest = candidates.size
+            val results = mutableListOf<ScoredTunnelCandidate>()
+
+            Timber.i(
+                "Preflight started: stage=pre-vpn network=%s fingerprint=%s total=%d candidates=%s",
+                profile.networkClass,
+                profile.fingerprint,
+                totalToTest,
+                candidates.joinToString { it.server.displayName },
+            )
+
+            for ((index, candidate) in candidates.withIndex()) {
+                val tag = candidate.outboundTag
+                val previousResult = results.lastOrNull()
+                _status.value = AutoOptimizerStatus.Probing(
+                    current = index + 1,
+                    total = totalToTest,
+                    serverDisplayName = candidate.server.displayName,
+                    lastSpeedKbps = previousResult?.probe?.throughputBytesPerSecond?.toKbps(),
+                    lastServerDisplayName = previousResult?.server?.displayName,
+                )
+                val switchStartedAt = SystemClock.elapsedRealtime()
+                val switched = vpnRepository.selectOutbound(AUTO_OPTIMIZER_SELECTOR_TAG, tag)
+                if (switched is com.lisvpn.android.core.common.result.AppResult.Failure) {
+                    Timber.w(
+                        "Preflight candidate skipped: switch failed server=%s tag=%s reason=%s",
+                        candidate.server.displayName,
+                        tag,
+                        switched.error,
+                    )
+                    continue
+                }
+                delay(PREFLIGHT_CANDIDATE_WARMUP_MS)
+
+                val probeResult = withTimeoutOrNull(PREFLIGHT_CANDIDATE_PROBE_TIMEOUT_MS) {
+                    AutoTunnelProbe.probe(candidate.server, elapsedSince(switchStartedAt))
+                } ?: AutoTunnelProbeResult(
+                    startupMs = null,
+                    dnsMs = null,
+                    httpRttMs = null,
+                    latencySamplesMs = emptyList(),
+                    throughputBytesPerSecond = null,
+                    internetCheckCount = 1,
+                    internetSuccessCount = 0,
+                    blockedCheckCount = 0,
+                    blockedSuccessCount = 0,
+                    stabilityCheckCount = 0,
+                    stabilitySuccessCount = 0,
+                ).also {
+                    Timber.w(
+                        "Preflight candidate timed out: server=%s tag=%s timeoutMs=%d",
+                        candidate.server.displayName,
+                        tag,
+                        PREFLIGHT_CANDIDATE_PROBE_TIMEOUT_MS,
+                    )
+                }
+                val score = probeResult.adaptiveScore(profile, candidate.server)
+                results += ScoredTunnelCandidate(candidate.server, tag, score, probeResult)
+                serverHealthRepository.record(probeResult.toHealthSnapshot(candidate.server))
+                Timber.i("Preflight candidate: %s", results.last().diagnosticLabel())
+            }
+
+            val best = results
+                .filter { it.probe.successful }
+                .sortedWith(
+                    compareByDescending<ScoredTunnelCandidate> { it.probe.throughputBytesPerSecond ?: 0L }
+                        .thenByDescending { it.score }
+                        .thenBy { it.probe.httpRttMs ?: Int.MAX_VALUE },
+                )
+                .firstOrNull()
+
+            if (best == null) {
+                Timber.w("Preflight finished: no successful candidate (tested=%d)", results.size)
+                _status.value = AutoOptimizerStatus.Failed("no successful probe")
+                return@withContext PreflightResult(null, null, null, results.size)
+            }
+
+            autoServerPreferenceStore.saveBest(profile, best.server, best.score)
+            val winnerSpeedKbps = best.probe.throughputBytesPerSecond?.toKbps()
+            val winnerIndex = candidates.indexOfFirst { it.outboundTag == best.outboundTag }
+                .takeIf { it >= 0 }
+            _status.value = AutoOptimizerStatus.Done(
+                bestServerDisplayName = best.server.displayName,
+                bestSpeedKbps = winnerSpeedKbps,
+                tested = results.size,
+            )
+            Timber.i(
+                "Preflight finished: best=%s tag=%s index=%s score=%d speedKbps=%d tested=%d network=%s",
+                best.server.displayName,
+                best.outboundTag,
+                winnerIndex,
+                (best.score * 100).roundToInt(),
+                winnerSpeedKbps ?: 0L,
+                results.size,
+                profile.networkClass,
+            )
+            PreflightResult(
+                winnerIndex = winnerIndex,
+                winnerOutboundTag = best.outboundTag,
+                winnerSpeedKbps = winnerSpeedKbps,
+                tested = results.size,
+            )
+        }
     }
 
     private suspend fun optimize(servers: List<Server>) = mutex.withLock {
@@ -365,6 +493,13 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
         // assumed the test is done and the optimiser was effectively running in the dark.
         const val OPTIMIZER_CANDIDATE_LIMIT = 6
         const val SPREAD_CANDIDATE_COUNT = 4
+        // Pre-VPN speed test budget. We test up to 5 candidates (already filtered by the
+        // SelectBestServerUseCase rank step) at ~5 s each, so the worst-case wait the user sees
+        // before the tunnel comes up is ~25 s. That feels long, but the alternative is exactly
+        // what the user complained about: "the speed test happens through the VPN already".
+        const val PREFLIGHT_CANDIDATE_LIMIT = 5
+        const val PREFLIGHT_CANDIDATE_PROBE_TIMEOUT_MS = 5_000L
+        const val PREFLIGHT_CANDIDATE_WARMUP_MS = 200L
         // 50 Mbps is a more realistic upper bound for a fast residential VPN; the old 3 Mbps cap
         // saturated the throughput component for almost every server, which silently neutralised
         // its weight in the optimiser score.

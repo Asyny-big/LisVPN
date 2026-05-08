@@ -16,7 +16,9 @@ import com.lisvpn.android.core.domain.model.AppRules
 import com.lisvpn.android.core.domain.model.ConnectedServer
 import com.lisvpn.android.core.domain.model.VpnState
 import com.lisvpn.android.core.domain.repository.AppRulesRepository
+import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
 import com.lisvpn.android.vpn.libbox.LibboxBridge
+import java.io.File
 import dagger.hilt.android.AndroidEntryPoint
 import javax.inject.Inject
 import kotlinx.coroutines.CoroutineScope
@@ -39,6 +41,8 @@ class LisVpnService : VpnService() {
     @Inject lateinit var controller: VpnConnectionController
     @Inject lateinit var notifier: VpnNotifier
     @Inject lateinit var appRulesRepository: AppRulesRepository
+    @Inject lateinit var startContext: VpnStartContext
+    @Inject lateinit var autoOptimizerRepository: AutoOptimizerRepository
     @Inject @IoDispatcher lateinit var ioDispatcher: CoroutineDispatcher
 
     private var serviceScope: CoroutineScope? = null
@@ -83,6 +87,7 @@ class LisVpnService : VpnService() {
             return
         }
         val serverLabel = intent.getStringExtra(VpnIntents.EXTRA_SERVER_LABEL)
+        val pending = startContext.consume()
 
         promoteForeground(VpnState.Connecting(serverLabel))
 
@@ -97,7 +102,64 @@ class LisVpnService : VpnService() {
                 stopSelfCleanly()
                 return@launch
             }
-            val rules = runCatching { appRulesRepository.observe().first() }.getOrDefault(AppRules.Default)
+            val rules = pending?.appRules
+                ?: runCatching { appRulesRepository.observe().first() }.getOrDefault(AppRules.Default)
+
+            // ----------------------------------------------------------
+            // AUTO mode preflight (pre-VPN speed test) — runs only when
+            // we have a multi-candidate AUTO start. Libbox is brought up in
+            // headless / SOCKS-only mode (no TUN), so the user's apps keep
+            // using the regular network while we measure each candidate.
+            // ----------------------------------------------------------
+            var winnerOutboundTag: String? = null
+            val preflightConfigJson = pending?.preflightConfigJson
+            val preflightCandidates = pending?.candidates.orEmpty()
+            val shouldRunPreflight =
+                pending != null &&
+                    pending.smartSelection &&
+                    !preflightConfigJson.isNullOrBlank() &&
+                    preflightCandidates.size > 1
+            if (shouldRunPreflight) {
+                val preflightBridge = LibboxBridge(
+                    service = this@LisVpnService,
+                    configJson = preflightConfigJson!!,
+                    appRules = rules,
+                )
+                bridge = preflightBridge
+                Timber.i("Preflight libbox: validate")
+                val preflightValidation = preflightBridge.validate()
+                if (preflightValidation.isFailure) {
+                    Timber.e(preflightValidation.exceptionOrNull(), "Preflight config validation failed; skipping preflight")
+                } else {
+                    Timber.i("Preflight libbox: start")
+                    val preflightStart = preflightBridge.start()
+                    if (preflightStart.isFailure) {
+                        Timber.e(preflightStart.exceptionOrNull(), "Preflight libbox start failed; skipping preflight")
+                    } else {
+                        val preflight = runCatching {
+                            autoOptimizerRepository.runPreflight(preflightCandidates)
+                        }
+                        preflight
+                            .onSuccess { result ->
+                                winnerOutboundTag = result.winnerOutboundTag
+                                Timber.i(
+                                    "Preflight finished: winnerTag=%s tested=%d speedKbps=%s",
+                                    result.winnerOutboundTag,
+                                    result.tested,
+                                    result.winnerSpeedKbps,
+                                )
+                            }
+                            .onFailure { Timber.e(it, "Preflight runPreflight() failed") }
+                    }
+                }
+                Timber.i("Preflight libbox: stop")
+                preflightBridge.stop()
+                bridge = null
+            }
+
+            // ----------------------------------------------------------
+            // Real VPN tunnel start
+            // ----------------------------------------------------------
             val newBridge = LibboxBridge(service = this@LisVpnService, configJson = configJson, appRules = rules)
             bridge = newBridge
             Timber.i("libbox config validation requested")
@@ -121,9 +183,19 @@ class LisVpnService : VpnService() {
                 stopSelfCleanly()
                 return@launch
             }
+            // Apply the preflight winner to the real tunnel's `auto` selector. The selector
+            // group is created with `outbounds.first()` as the default — we override it here
+            // so that the connected user actually goes through the candidate the preflight
+            // measured to be fastest, not just the first server in the bootstrap-ranked list.
+            val winnerTag = winnerOutboundTag
+            if (winnerTag != null) {
+                Timber.i("Applying preflight winner to auto selector: outbound=%s", winnerTag)
+                newBridge.selectOutbound(AUTO_SELECTOR_TAG, winnerTag)
+                    .onFailure { Timber.w(it, "Failed to apply preflight winner to auto selector") }
+            }
             val cs = ConnectedServer(
                 serverId = serverLabel.orEmpty(),
-                displayName = serverLabel ?: "Авто",
+                displayName = winnerDisplayNameOrFallback(winnerTag, pending) ?: serverLabel ?: "Авто",
                 countryCode = null,
             )
             val now = Clock.System.now()
@@ -134,6 +206,15 @@ class LisVpnService : VpnService() {
             controller.publishConnected(cs, now)
             updateNotification(VpnState.Connected(cs, now))
         }
+    }
+
+    private fun winnerDisplayNameOrFallback(
+        winnerTag: String?,
+        pending: VpnStartContext.Pending?,
+    ): String? {
+        if (winnerTag == null || pending == null) return null
+        val index = winnerTag.removePrefix("srv-").toIntOrNull() ?: return null
+        return pending.candidates.getOrNull(index)?.displayName
     }
 
     private fun handleStop() {
@@ -384,5 +465,9 @@ class LisVpnService : VpnService() {
         const val RECONNECT_MAX_DELAY_MS = 30_000L
         const val RECONNECT_JITTER_MS = 1_500L
         const val RECONNECT_MAX_EXPONENT = 5
+        // Mirrors com.lisvpn.android.vpn.config.SingBoxConfigBuilder.AUTO_TAG. Kept private over
+        // there to keep the builder's surface tight; here it's just the wire string we hand back
+        // to libbox via selectOutbound().
+        const val AUTO_SELECTOR_TAG = "auto"
     }
 }

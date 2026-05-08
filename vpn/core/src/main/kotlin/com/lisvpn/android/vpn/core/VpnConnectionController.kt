@@ -24,6 +24,7 @@ import timber.log.Timber
 class VpnConnectionController @Inject constructor(
     @ApplicationContext private val context: Context,
     private val configAssembler: VpnConfigAssembler,
+    private val startContext: VpnStartContext,
 ) {
     private val mutex = Mutex()
     private val _state = MutableStateFlow<VpnState>(VpnState.Idle)
@@ -59,6 +60,15 @@ class VpnConnectionController @Inject constructor(
                 _state.value = VpnState.Error(VpnState.Reason.ConfigInvalid, err.message)
             }
             .getOrElse { return Result.failure(it) }
+        // In AUTO mode with multiple candidates we run a pre-VPN speed test (libbox in
+        // SOCKS-only mode, no TUN, all candidates as outbounds) before the real tunnel comes up.
+        // The user sees that progress in the Connecting subtitle so they know the AUTO pick is
+        // grounded in a real download measurement and not just a latency heuristic.
+        val preflightConfigJson = if (smartSelection && servers.size > 1) {
+            runCatching { configAssembler.assemblePreflight(servers, appRules) }
+                .onFailure { err -> Timber.w(err, "Preflight config assembly failed; falling back to direct connect") }
+                .getOrNull()
+        } else null
         val displayName = if (smartSelection && servers.size > 1) {
             "Авто · ${servers.size} кандидатов"
         } else {
@@ -67,11 +77,23 @@ class VpnConnectionController @Inject constructor(
 
         _state.value = VpnState.Connecting(serverDisplayName = displayName)
         Timber.i(
-            "VPN start requested: servers=%d smart=%s configBytes=%d candidates=%s",
+            "VPN start requested: servers=%d smart=%s configBytes=%d preflight=%s candidates=%s",
             servers.size,
             smartSelection,
             configJson.length,
+            preflightConfigJson != null,
             servers.joinToString { it.diagnosticLabel() },
+        )
+
+        startContext.stage(
+            VpnStartContext.Pending(
+                candidates = servers,
+                smartSelection = smartSelection,
+                realConfigJson = configJson,
+                preflightConfigJson = preflightConfigJson,
+                appRules = appRules,
+                displayName = displayName,
+            )
         )
 
         runCatching {
@@ -116,10 +138,14 @@ class VpnConnectionController @Inject constructor(
 
     suspend fun selectOutbound(groupTag: String, outboundTag: String): Result<Unit> = mutex.withLock {
         val current = _state.value
-        if (current !is VpnState.Connected && current !is VpnState.Reconnecting) {
+        // We accept selector switches during Connecting too because the AUTO mode preflight
+        // phase runs libbox in headless / SOCKS-only mode while the controller's state is still
+        // Connecting (no TUN attached yet). The libbox bridge itself enforces "actually
+        // running" via its own isRunning() check, so this is safe.
+        if (current !is VpnState.Connected && current !is VpnState.Reconnecting && current !is VpnState.Connecting) {
             return Result.failure(IllegalStateException("VPN is not connected"))
         }
-        Timber.i("VPN outbound switch requested: group=%s outbound=%s", groupTag, outboundTag)
+        Timber.i("VPN outbound switch requested: group=%s outbound=%s state=%s", groupTag, outboundTag, current::class.simpleName)
         runCatching {
             val intent = Intent(context, LisVpnService::class.java).apply {
                 action = VpnIntents.ACTION_SELECT_OUTBOUND
