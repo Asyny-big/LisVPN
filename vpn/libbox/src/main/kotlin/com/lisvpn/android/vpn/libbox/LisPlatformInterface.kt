@@ -195,8 +195,21 @@ class LisPlatformInterface(
     override fun readWIFIState(): WIFIState = WIFIState("", "")
 
     override fun writeLog(message: String) {
-        Timber.tag(TAG_LIBBOX).d(message)
+        // sing-box logs `WARN inbound/tun: bind forwarder to interface: route ip+net:
+        // netlinkrib: permission denied` on every start. On Android the app process never has
+        // CAP_NET_ADMIN to read RTNETLINK, the WARN is benign (libbox falls back to the regular
+        // route table via JNI) but it pollutes every connection log and looks like a real bug
+        // in user reports. Drop it to debug, keep every other libbox log line as-is.
+        if (message.isLibboxBenignWarning()) {
+            Timber.tag(TAG_LIBBOX_NOISY).v(message)
+        } else {
+            Timber.tag(TAG_LIBBOX).d(message)
+        }
     }
+
+    private fun String.isLibboxBenignWarning(): Boolean =
+        contains("netlinkrib: permission denied") ||
+            contains("operation not permitted") && contains("netlink")
 
     private fun TunOptions.safeMtu(): Int =
         runCatching { getMTU().takeIf { it > 0 } ?: TUN_MTU }.getOrDefault(TUN_MTU)
@@ -287,7 +300,15 @@ class LisPlatformInterface(
     private companion object {
         const val SESSION_NAME = "LisVPN"
         const val TAG_LIBBOX = "libbox"
-        const val TUN_MTU = 1280
+        const val TAG_LIBBOX_NOISY = "libbox-noise"
+        // sing-box previously asked us for a 1280 MTU (IPv6 minimum). On a TCP-over-TLS-over-
+        // REALITY transport the inner TCP MSS shrinks to ~1180 bytes once you account for the
+        // TLS record + REALITY overhead. Big TLS records from the upstream (Telegram, YouTube)
+        // get split into many small segments, killing throughput and triggering retransmits
+        // that look indistinguishable from packet loss. 1420 is the conservative ceiling that
+        // still leaves slack for the TCP/TLS framing on the underlying carrier (most cellular
+        // and Wi-Fi paths support 1500 MTU end-to-end).
+        const val TUN_MTU = 1420
         const val TUN_IPV4_ADDRESS = "172.19.0.1"
         const val TUN_IPV4_PREFIX = 30
         const val TUN_DNS_SERVER = "172.19.0.2"

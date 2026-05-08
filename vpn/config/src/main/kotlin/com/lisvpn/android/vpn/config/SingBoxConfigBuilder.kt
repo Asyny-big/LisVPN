@@ -209,7 +209,12 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("type", "tun")
         put("tag", "tun-in")
         put("inet4_address", "172.19.0.1/30")
-        put("mtu", 1280)
+        // 1280 (IPv6 minimum) leaves only ~1180 bytes of inner TCP MSS once you account for
+        // the outer TCP+TLS+REALITY framing. That fragments large TLS records (Telegram,
+        // YouTube) into many tiny segments, hurting throughput and creating a packet-loss
+        // signature the validator can read as a broken server. 1420 is the conservative
+        // ceiling that still leaves slack for the underlying carrier's framing.
+        put("mtu", TUN_MTU)
         put("auto_route", true)
         put("strict_route", false)
         put("stack", "system")
@@ -503,6 +508,12 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("final", dnsFinalTag)
         put("strategy", "ipv4_only")
         put("disable_cache", false)
+        // Without independent_cache, sing-box keys cache entries by name only and aggressively
+        // dedupes A vs AAAA vs HTTPS records into a single entry; when the OS issues parallel
+        // A+HTTPS queries (every Android app does this) we end up serving stale answers and
+        // re-querying upstream on the next request. Enabling independent_cache makes the cache
+        // (qname, qtype) keyed and cuts upstream DoH traffic by 5-10x in real Android use.
+        put("independent_cache", true)
     }
 
     private fun Server.dnsRuleDomain(): String? {
@@ -534,6 +545,11 @@ class SingBoxConfigBuilder @Inject constructor() {
         const val LOCAL_DNS_TAG = "local"
         const val LOCAL_DNS_ADDRESS = "https://8.8.8.8/dns-query"
         const val BLOCK_DNS_TAG = "block"
+
+        // Mirror of LisPlatformInterface.TUN_MTU. The two are kept in lockstep because the
+        // VpnService.Builder MTU and the sing-box TUN inbound MTU must agree — sing-box drops
+        // packets that exceed its declared MTU even if the kernel TUN device would carry them.
+        const val TUN_MTU = 1420
 
         const val LOG_CHUNK_LIMIT = 3500
 

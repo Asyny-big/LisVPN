@@ -14,6 +14,8 @@ import libbox.OutboundGroupIterator
 import libbox.StatusMessage
 import libbox.StringIterator
 import libbox.SystemProxyStatus
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicBoolean
 import timber.log.Timber
 
 /**
@@ -34,6 +36,7 @@ class LibboxBridge(
     @Volatile private var box: BoxService? = null
     @Volatile private var platform: LisPlatformInterface? = null
     @Volatile private var commandServer: CommandServer? = null
+    private val fingerprintLogged = AtomicBoolean(false)
 
     /**
      * Validates the supplied [configJson] without actually starting the tunnel.
@@ -62,7 +65,14 @@ class LibboxBridge(
             // Log libbox version up front so that bug reports always identify which sing-box
             // build the user was on. Specific protocols (notably VLESS+REALITY+Vision) have
             // had compatibility fixes across releases, so the version is critical context.
-            Timber.tag("libbox-runtime").i("libbox version=%s configBytes=%d", Libbox.version(), configJson.length)
+            // The first time we see "unknown" (the AAR was built without -ldflags), we also log
+            // a SHA-256 of the libbox classes themselves so different builds of the AAR are at
+            // least distinguishable in user reports.
+            val version = runCatching { Libbox.version() }.getOrDefault("unknown")
+            Timber.tag(TAG_LIBBOX_RUNTIME).i("libbox version=%s configBytes=%d", version, configJson.length)
+            if (version.isBlank() || version == "unknown") {
+                logLibboxFingerprint()
+            }
 
             val newPlatform = LisPlatformInterface(service = service, appRules = appRules)
             platform = newPlatform
@@ -125,6 +135,49 @@ class LibboxBridge(
         LibboxEnvironment.ensureInitialized(service)
     }
 
+    /**
+     * sing-box's `Libbox.version()` returns the empty/unknown string when the AAR was built
+     * without `-ldflags "-X main.commit=..."`, which is currently the case for the AAR vendored
+     * in this repo. To still uniquely identify the AAR in bug reports we hash a small set of
+     * `libbox.*` class bytecodes — different sing-box builds will produce different bytecode
+     * even if the public Java surface is identical. The result is a stable 12-char fingerprint
+     * that survives reinstalls (it's purely a function of the bundled AAR).
+     */
+    private fun logLibboxFingerprint() {
+        if (!fingerprintLogged.compareAndSet(false, true)) return
+        runCatching {
+            val classNames = listOf(
+                "libbox.Libbox.class",
+                "libbox.BoxService.class",
+                "libbox.PlatformInterface.class",
+            )
+            val loader = Libbox::class.java.classLoader
+            val digest = MessageDigest.getInstance("SHA-256")
+            var bytesHashed = 0L
+            for (resource in classNames) {
+                val stream = loader?.getResourceAsStream(resource.replace('.', '/').replaceFirst("/class", ".class"))
+                    ?: continue
+                stream.use { input ->
+                    val buffer = ByteArray(8 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read <= 0) break
+                        digest.update(buffer, 0, read)
+                        bytesHashed += read
+                    }
+                }
+            }
+            val codeSource = Libbox::class.java.protectionDomain?.codeSource?.location?.toString().orEmpty()
+            val fingerprint = digest.digest().joinToString("") { "%02x".format(it) }.take(12)
+            Timber.tag(TAG_LIBBOX_RUNTIME).i(
+                "libbox fingerprint=%s classBytesHashed=%d codeSource=%s",
+                fingerprint,
+                bytesHashed,
+                codeSource,
+            )
+        }.onFailure { Timber.tag(TAG_LIBBOX_RUNTIME).w(it, "libbox fingerprint computation failed") }
+    }
+
     private fun startCommandServer(runningBox: BoxService) {
         runCatching {
             val server = Libbox.newCommandServer(NoopCommandServerHandler, COMMAND_LOG_LINES)
@@ -182,5 +235,6 @@ class LibboxBridge(
 
     private companion object {
         const val COMMAND_LOG_LINES = 256
+        const val TAG_LIBBOX_RUNTIME = "libbox-runtime"
     }
 }

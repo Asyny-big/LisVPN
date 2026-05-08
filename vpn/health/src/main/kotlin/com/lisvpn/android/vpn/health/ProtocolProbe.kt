@@ -101,6 +101,7 @@ class ProtocolProbe @Inject constructor(
                 tls = null,
                 transportStep = null,
                 metadata = null,
+                realityCamouflage = null,
                 startedAt = startedAt,
                 probeId = probeId,
             )
@@ -131,6 +132,7 @@ class ProtocolProbe @Inject constructor(
                 tls = null,
                 transportStep = null,
                 metadata = null,
+                realityCamouflage = null,
                 startedAt = startedAt,
                 probeId = probeId,
             )
@@ -175,6 +177,33 @@ class ProtocolProbe @Inject constructor(
             )
         }
 
+        // For REALITY the lightweight probe used to stop after metadata validation, which only
+        // checks that the user supplied non-empty SNI and public_key. That gives us no signal
+        // about whether the proxy is actually camouflaging correctly — and a misconfigured
+        // REALITY server (or a server that has been rotated to a new key) silently passes the
+        // pre-flight and only fails post-tunnel HTTP validation, which is what users see as
+        // "VPN включён, инета нет". Doing a real TLS handshake to the proxy IP using the
+        // REALITY SNI gives us three signals at once: (a) the proxy is up, (b) it correctly
+        // mimics the SNI host's TLS stack, (c) the SNI host's cert chain is publicly valid.
+        // We can't validate Vision flow itself without a libbox-backed transport, so HTTP
+        // through the tunnel is still post-validated — but at least obviously broken REALITY
+        // setups now fail fast.
+        val realityCamouflage = if (security is Security.Reality) {
+            measureRealityCamouflage(endpoint, security).also { step ->
+                Timber.i(
+                    "Protocol probe Reality camouflage: id=%s server=%s sni=%s success=%s elapsedMs=%s reason=%s",
+                    probeId,
+                    server.displayName,
+                    security.sni,
+                    step.success,
+                    step.elapsedMs,
+                    step.reason,
+                )
+            }
+        } else {
+            null
+        }
+
         val transportStep = if (transport.requiresHttpPreflight() && security !is Security.Reality) {
             Timber.i(
                 "Protocol probe HTTP before test: id=%s server=%s transport=%s",
@@ -211,6 +240,7 @@ class ProtocolProbe @Inject constructor(
             tls = tls,
             transportStep = transportStep,
             metadata = metadata,
+            realityCamouflage = realityCamouflage,
             startedAt = startedAt,
             probeId = probeId,
         )
@@ -223,24 +253,30 @@ class ProtocolProbe @Inject constructor(
         tls: ProbeStep?,
         transportStep: ProbeStep?,
         metadata: ProbeStep?,
+        realityCamouflage: ProbeStep?,
         startedAt: Long,
         probeId: String,
     ): ProtocolProbeResult {
         val outbound = server.outbound
         val security = outbound.security()
         val transport = outbound.transport()
-        val validationSteps = listOfNotNull(tcp, tls, metadata, transportStep)
+        val validationSteps = listOfNotNull(tcp, tls, metadata, realityCamouflage, transportStep)
         val success = when {
             !tcp.success -> false
             transport.requiresHttpPreflight() && security !is Security.Reality -> transportStep?.success == true
             security is Security.Tls -> tls?.success == true
-            security is Security.Reality -> metadata?.success == true
+            // For REALITY require both that the user-supplied metadata is non-empty AND that the
+            // proxy actually mimics the SNI host. This catches misconfigured/rotated REALITY
+            // servers at probe time instead of after the tunnel comes up. We deliberately do
+            // not require Vision/HTTP through the proxy here — that needs libbox and is left
+            // to TunnelValidationWorker post-connect.
+            security is Security.Reality -> metadata?.success == true && realityCamouflage?.success == true
             outbound is Outbound.Shadowsocks -> true
             security == Security.None -> true
             else -> false
         }
         val elapsedMs = elapsedSince(startedAt)
-        val bestProtocolMs = listOfNotNull(transportStep?.elapsedMs, tls?.elapsedMs, metadata?.elapsedMs, tcp.elapsedMs).minOrNull()
+        val bestProtocolMs = listOfNotNull(transportStep?.elapsedMs, tls?.elapsedMs, realityCamouflage?.elapsedMs, metadata?.elapsedMs, tcp.elapsedMs).minOrNull()
         val downloadedBytes = transportStep?.bytesRead ?: 0L
         val downloadMs = transportStep?.elapsedMs
         val snapshot = HealthSnapshot(
@@ -344,6 +380,49 @@ class ProtocolProbe @Inject constructor(
             bytesRead = 0L,
             reason = if (success) null else "Reality metadata is incomplete",
         )
+    }
+
+    /**
+     * Performs a regular TLS handshake to the proxy IP:port using the REALITY [Security.sni] as
+     * the server name. A correctly-configured REALITY proxy steganographically forwards
+     * unauthenticated traffic to the SNI host, so this handshake should complete successfully
+     * and the proxy should present the SNI host's real cert chain. If the proxy is offline,
+     * unreachable, or misconfigured, this fails fast and the lightweight probe surfaces the
+     * problem before the user sits through a 7-second tunnel HTTP timeout.
+     *
+     * Note: this does NOT validate Vision/XTLS or that the proxy will accept VLESS — those
+     * require a real REALITY client (libbox). Post-tunnel HTTP validation in
+     * [com.lisvpn.android.vpn.health.TunnelValidationWorker] is still the source of truth for
+     * "does the tunnel actually carry traffic". This step is purely a fast pre-connect signal
+     * that the public side of the proxy looks healthy.
+     */
+    private fun measureRealityCamouflage(endpoint: ProbeEndpoint, security: Security.Reality): ProbeStep {
+        val startedAt = SystemClock.elapsedRealtime()
+        val sni = security.sni.takeIf { it.isNotBlank() && it.canBeSniHost() }
+        if (sni == null) {
+            return ProbeStep(
+                success = false,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = "Reality sni is missing or not a hostname",
+            )
+        }
+        return runCatching {
+            connectTlsSocket(endpoint, sni, allowInsecure = false).use { }
+            ProbeStep(
+                success = true,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = null,
+            )
+        }.getOrElse { err ->
+            ProbeStep(
+                success = false,
+                elapsedMs = elapsedSince(startedAt),
+                bytesRead = 0L,
+                reason = err.protocolProbeReason(),
+            )
+        }
     }
 
     private fun measureHttpTransportPreflight(

@@ -44,8 +44,10 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import kotlin.random.Random
@@ -184,6 +186,15 @@ class LisVpnService : VpnService() {
                 ?.takeIf { !it.smartSelection }
                 ?.candidates
                 ?.singleOrNull()
+            // Register the network callback BEFORE running tunnel validation. The callback is
+            // what suspends/wakes libbox when the underlying network flips (Wi-Fi <-> cellular).
+            // If validation runs first and the underlying network drops during those ~7 seconds,
+            // we miss the onLost callback and the tunnel comes up dead. Registering early is
+            // idempotent (registerNetworkCallback() bails if already set) and harmless even if
+            // the user later cancels the start.
+            if (manualCandidate != null) {
+                registerNetworkCallback()
+            }
             if (manualCandidate != null && !validateManualTunnel(newBridge, manualCandidate)) {
                 bridge = null
                 stopSelfCleanly()
@@ -580,7 +591,20 @@ class LisVpnService : VpnService() {
         reconnectWakeJob?.cancel()
         failoverJob?.cancel()
         unregisterNetworkCallback()
-        runCatching { kotlinx.coroutines.runBlocking { bridge?.stop() } }
+        // bridge.stop() ultimately calls into libbox which can hang on REALITY shutdown when the
+        // server socket has not been gracefully torn down (this is a known sing-box pre-1.7
+        // behaviour). Without a bound, runBlocking here will keep the main thread frozen long
+        // enough that the OS force-stops the service and we never get to release the TUN fd or
+        // unregister state. Bound the wait to BRIDGE_STOP_TIMEOUT_MS so that we still degrade
+        // gracefully — the OS will reap the leftover goroutines when the process dies.
+        val bridgeRef = bridge
+        runCatching {
+            runBlocking {
+                withTimeoutOrNull(BRIDGE_STOP_TIMEOUT_MS) {
+                    bridgeRef?.stop()
+                } ?: Timber.w("bridge.stop() exceeded %d ms in onDestroy, giving up", BRIDGE_STOP_TIMEOUT_MS)
+            }
+        }.onFailure { Timber.w(it, "bridge.stop() threw in onDestroy") }
         bridge = null
         startJob = null
         failoverJob = null
@@ -778,5 +802,10 @@ class LisVpnService : VpnService() {
         // there to keep the builder's surface tight; here it's just the wire string we hand back
         // to libbox via selectOutbound().
         const val AUTO_SELECTOR_TAG = "auto"
+        // Hard ceiling for how long we let the libbox runtime tear itself down on the main
+        // thread inside onDestroy. Past this, the Android service supervisor will start
+        // ANR'ing us anyway, so giving up cleanly and letting the process exit is strictly
+        // better than freezing the UI thread.
+        const val BRIDGE_STOP_TIMEOUT_MS = 2_000L
     }
 }
