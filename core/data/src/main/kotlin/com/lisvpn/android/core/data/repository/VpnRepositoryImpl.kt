@@ -42,7 +42,15 @@ class VpnRepositoryImpl @Inject constructor(
         permission: VpnPermissionHandle,
     ): AppResult<Unit> {
         val rules = runCatching { appRulesRepository.observe().first() }.getOrDefault(AppRules.Default)
-        val resolvedServers = withContext(ioDispatcher) { servers.map { it.withResolvedHost() } }
+        val resolvedServers = withContext(ioDispatcher) {
+            if (smartSelection) {
+                servers.mapIndexed { index, server ->
+                    if (index == 0) server.withResolvedHost() else server
+                }
+            } else {
+                servers.map { it.withResolvedHost() }
+            }
+        }
         return controller.start(
             servers = resolvedServers,
             smartSelection = smartSelection,
@@ -58,6 +66,13 @@ class VpnRepositoryImpl @Inject constructor(
         return controller.stop().fold(
             onSuccess = { AppResult.Success(Unit) },
             onFailure = { AppResult.Failure(AppError.Vpn(it.message ?: "stop failed"), it) },
+        )
+    }
+
+    override suspend fun selectOutbound(groupTag: String, outboundTag: String): AppResult<Unit> {
+        return controller.selectOutbound(groupTag, outboundTag).fold(
+            onSuccess = { AppResult.Success(Unit) },
+            onFailure = { AppResult.Failure(AppError.Vpn(it.message ?: "select outbound failed"), it) },
         )
     }
 

@@ -30,7 +30,7 @@ import timber.log.Timber
  *   "outbounds": [
  *     { type: direct },{ type: block },{ type: dns },
  *     ...per-server outbounds...,
- *     { type: urltest, outbounds: [...] }     // only when smartSelection
+ *     { type: selector, outbounds: [...], default: first } // only when smartSelection
  *   ],
  *   "route": { rules, final }
  * }
@@ -53,11 +53,9 @@ class SingBoxConfigBuilder @Inject constructor() {
 
         val outboundTags = servers.indices.map { index -> "srv-$index" }
         check(outboundTags.distinct().size == outboundTags.size) { "Generated duplicate outbound tags" }
-        val finalTag = when {
-            smartSelection && servers.size > 1 -> AUTO_TAG
-            else -> outboundTags.first()
-        }
-        check(!smartSelection || servers.size <= 1 || outboundTags.isNotEmpty()) { "Cannot build urltest without server outbounds" }
+        val includeSelector = smartSelection && servers.size > 1
+        val finalTag = if (includeSelector) AUTO_TAG else outboundTags.first()
+        check(!includeSelector || outboundTags.isNotEmpty()) { "Cannot build selector without server outbounds" }
         Timber.i(
             "Building sing-box config: servers=%d smart=%s final=%s outbounds=%s",
             servers.size,
@@ -66,11 +64,11 @@ class SingBoxConfigBuilder @Inject constructor() {
             servers.joinToString { it.diagnosticLabel() },
         )
         Timber.i(
-            "Building sing-box selector: smart=%s includeUrltest=%s final=%s url=%s selectorOutbounds=%s",
+            "Building sing-box selector: smart=%s includeSelector=%s final=%s default=%s selectorOutbounds=%s",
             smartSelection,
-            smartSelection && servers.size > 1,
+            includeSelector,
             finalTag,
-            URLTEST_URL,
+            outboundTags.first(),
             outboundTags.joinToString(),
         )
 
@@ -79,18 +77,22 @@ class SingBoxConfigBuilder @Inject constructor() {
                 put("level", "warn")
                 put("timestamp", true)
             })
-            put("dns", buildDns(finalTag, servers, smartSelection && servers.size > 1))
-            putJsonArray("inbounds") { add(buildTunInbound()) }
+            put("dns", buildDns(finalTag, servers))
+            putJsonArray("inbounds") {
+                add(buildTunInbound())
+                if (smartSelection) add(buildOptimizerMixedInbound())
+            }
             putJsonArray("outbounds") {
                 add(directOutbound())
                 add(blockOutbound())
                 add(dnsOutbound())
                 servers.forEachIndexed { i, srv -> add(buildServerOutbound(srv, outboundTags[i])) }
-                if (smartSelection && servers.size > 1) {
-                    add(buildUrltestOutbound(outboundTags))
+                if (includeSelector) {
+                    add(buildSelectorOutbound(outboundTags))
+                    add(buildOptimizerSelectorOutbound(outboundTags))
                 }
             }
-            put("route", buildRoute(finalTag))
+            put("route", buildRoute(finalTag, optimizerEnabled = includeSelector))
         }
         return json.encodeToString(JsonObject.serializer(), root)
     }
@@ -108,6 +110,14 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("sniff", true)
         put("sniff_override_destination", false)
         put("endpoint_independent_nat", true)
+    }
+
+    private fun buildOptimizerMixedInbound(): JsonObject = buildJsonObject {
+        put("type", "mixed")
+        put("tag", OPTIMIZER_INBOUND_TAG)
+        put("listen", "127.0.0.1")
+        put("listen_port", OPTIMIZER_SOCKS_PORT)
+        put("sniff", true)
     }
 
     // ---- Outbounds ---------------------------------------------------------
@@ -176,13 +186,20 @@ class SingBoxConfigBuilder @Inject constructor() {
         put("domain_strategy", "ipv4_only")
     }
 
-    private fun buildUrltestOutbound(outboundTags: List<String>): JsonObject = buildJsonObject {
-        put("type", "urltest")
+    private fun buildSelectorOutbound(outboundTags: List<String>): JsonObject = buildJsonObject {
+        put("type", "selector")
         put("tag", AUTO_TAG)
         putJsonArray("outbounds") { outboundTags.forEach { add(it) } }
-        put("url", URLTEST_URL)
-        put("interval", "10m")
-        put("tolerance", 50)
+        put("default", outboundTags.first())
+        put("interrupt_exist_connections", true)
+    }
+
+    private fun buildOptimizerSelectorOutbound(outboundTags: List<String>): JsonObject = buildJsonObject {
+        put("type", "selector")
+        put("tag", OPTIMIZER_SELECTOR_TAG)
+        putJsonArray("outbounds") { outboundTags.forEach { add(it) } }
+        put("default", outboundTags.first())
+        put("interrupt_exist_connections", true)
     }
 
     private fun encodeTls(
@@ -254,11 +271,17 @@ class SingBoxConfigBuilder @Inject constructor() {
 
     // ---- Route & DNS -------------------------------------------------------
 
-    private fun buildRoute(finalTag: String): JsonObject = buildJsonObject {
+    private fun buildRoute(finalTag: String, optimizerEnabled: Boolean): JsonObject = buildJsonObject {
         put("auto_detect_interface", true)
         put("override_android_vpn", true)
         put("final", finalTag)
         putJsonArray("rules") {
+            if (optimizerEnabled) {
+                addJsonObject {
+                    putJsonArray("inbound") { add(OPTIMIZER_INBOUND_TAG) }
+                    put("outbound", OPTIMIZER_SELECTOR_TAG)
+                }
+            }
             // DNS hijack
             addJsonObject {
                 put("protocol", "dns")
@@ -286,11 +309,8 @@ class SingBoxConfigBuilder @Inject constructor() {
         }
     }
 
-    private fun buildDns(finalTag: String, servers: List<Server>, includeUrltestDomain: Boolean): JsonObject = buildJsonObject {
-        val localDomains = (
-            servers.mapNotNull { it.dnsRuleDomain() } +
-                listOfNotNull(URLTEST_DOMAIN.takeIf { includeUrltestDomain })
-            ).distinct()
+    private fun buildDns(finalTag: String, servers: List<Server>): JsonObject = buildJsonObject {
+        val localDomains = servers.mapNotNull { it.dnsRuleDomain() }.distinct()
         Timber.i(
             "Building sing-box DNS: final=%s localDomains=%s remote=%s address=%s local=%s",
             finalTag,
@@ -303,7 +323,7 @@ class SingBoxConfigBuilder @Inject constructor() {
             addJsonObject {
                 put("tag", REMOTE_DNS_TAG)
                 put("address", REMOTE_DNS_ADDRESS)
-                put("detour", DIRECT_TAG)
+                put("detour", finalTag)
                 put("strategy", "ipv4_only")
             }
             addJsonObject {
@@ -351,11 +371,12 @@ class SingBoxConfigBuilder @Inject constructor() {
         const val BLOCK_TAG = "block"
         const val DNS_TAG = "dns-out"
         const val AUTO_TAG = "auto"
+        const val OPTIMIZER_SELECTOR_TAG = "auto-optimizer"
+        const val OPTIMIZER_INBOUND_TAG = "auto-optimizer-in"
+        const val OPTIMIZER_SOCKS_PORT = 2080
         const val REMOTE_DNS_TAG = "remote"
         const val REMOTE_DNS_ADDRESS = "https://1.1.1.1/dns-query"
         const val LOCAL_DNS_TAG = "local"
         const val BLOCK_DNS_TAG = "block"
-        const val URLTEST_DOMAIN = "speed.cloudflare.com"
-        const val URLTEST_URL = "https://speed.cloudflare.com/__down?bytes=1048576"
     }
 }

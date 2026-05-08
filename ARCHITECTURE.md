@@ -102,25 +102,28 @@ LibboxBridge ──▶ libbox.Libbox.newService(configJson, LisPlatformInterface
 
 - `inbounds[0]` — a TUN inbound with `auto_route=true`, `strict_route=true`, `stack=system`.
 - `outbounds` — `direct` / `block` / `dns-out` plus one outbound per server.
-- When `smartSelection && servers.size > 1` an additional `urltest` outbound is added that
-  becomes the route's `final` target — sing-box will probe `generate_204` every 3 minutes and
-  switch to the lowest-latency outbound automatically.
+- When `smartSelection && servers.size > 1` an additional `selector` outbound is added that
+  becomes the route's `final` target. The first server is a stable bootstrap choice; AUTO then
+  switches this selector through libbox commands after in-tunnel optimization.
 
-## §5 Smart server selection (two-level)
+## §5 Smart server selection (two-stage AUTO)
 
 | Level | Where | Frequency | Output |
 |---|---|---|---|
-| 1 — App-side ranking | `:vpn:health` (Phase 8) → Room | Every 30 min when on cellular/Wi-Fi | Top-N by score |
-| 2 — Real-time | sing-box `urltest` outbound | Every 3 min during connection | Live winner |
+| 1 — Bootstrap | `SelectBestServerUseCase` + cache | On AUTO connect | Stable first outbound |
+| 2 — In-tunnel optimizer | `AutoOptimizerRepositoryImpl` + existing `BoxService` selector | After connected | Best outbound by adaptive score |
 
 Score formula:
 
 ```
-score = 0.45 * (1 - normLatency)
-      + 0.20 * (1 - normHandshake)
-      + 0.20 * successRate24h
-      + 0.10 * networkTypeStability
-      + 0.05 * recencyOfLastSuccess
+score = wThroughput * throughput
+      + wLatency * httpRtt
+      + wDns * dnsLatency
+      + wStartup * startupLatency
+      + wJitter * jitter
+      + wPacketLoss * packetLoss
+      + wBlockedReachability * (YouTube + Telegram)
+      + wReconnectStability * reconnectStability
 ```
 
 ## §6 Per-app routing (split tunneling)

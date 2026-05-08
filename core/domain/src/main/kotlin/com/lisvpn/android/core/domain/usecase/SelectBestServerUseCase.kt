@@ -6,11 +6,11 @@ import javax.inject.Inject
 import timber.log.Timber
 
 /**
- * App-side ranking. Returns up to [limit] best-scored servers; sing-box `urltest` outbound performs
- * the real-time selection in the kernel afterwards.
+ * App-side AUTO bootstrap ordering. Returns a stable first server quickly; the background optimizer
+ * later switches the running selector after real in-tunnel checks.
  *
- * If no scores are available yet (cold start), returns servers with [Server.Tag.Primary] first,
- * then in original order.
+ * If no cache or historical scores are available yet (cold start), stable/manual tags win first,
+ * then original subscription order.
  */
 class SelectBestServerUseCase @Inject constructor(
     private val healthRepository: ServerHealthRepository,
@@ -19,7 +19,7 @@ class SelectBestServerUseCase @Inject constructor(
         if (servers.isEmpty()) return emptyList()
         val ranked = healthRepository.rank(servers, limit)
         Timber.i(
-            "Auto server selection result: requested=%d reachable=%d selected=%s",
+            "Auto server selection result: requested=%d ranked=%d selected=%s",
             servers.size,
             ranked.size,
             ranked.joinToString { it.displayName },

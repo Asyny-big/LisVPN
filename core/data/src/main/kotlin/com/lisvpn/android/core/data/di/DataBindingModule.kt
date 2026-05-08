@@ -1,11 +1,13 @@
 package com.lisvpn.android.core.data.di
 
 import com.lisvpn.android.core.data.repository.AppRulesRepositoryImpl
+import com.lisvpn.android.core.data.repository.AutoOptimizerRepositoryImpl
 import com.lisvpn.android.core.data.repository.InstalledAppsRepositoryImpl
 import com.lisvpn.android.core.data.repository.ProfileRepositoryImpl
 import com.lisvpn.android.core.data.repository.ServerHealthRepositoryImpl
 import com.lisvpn.android.core.data.repository.VpnRepositoryImpl
 import com.lisvpn.android.core.domain.repository.AppRulesRepository
+import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
 import com.lisvpn.android.core.domain.repository.InstalledAppsRepository
 import com.lisvpn.android.core.domain.repository.ProfileRepository
 import com.lisvpn.android.core.domain.repository.ServerHealthRepository
@@ -32,6 +34,9 @@ abstract class DataBindingModule {
 
     @Binds @Singleton
     abstract fun bindAppRulesRepository(impl: AppRulesRepositoryImpl): AppRulesRepository
+
+    @Binds @Singleton
+    abstract fun bindAutoOptimizerRepository(impl: AutoOptimizerRepositoryImpl): AutoOptimizerRepository
 
     @Binds @Singleton
     abstract fun bindServerHealthRepository(impl: ServerHealthRepositoryImpl): ServerHealthRepository

@@ -5,7 +5,15 @@ import com.lisvpn.android.core.domain.model.AppRules
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import libbox.BoxService
+import libbox.CommandClientHandler
+import libbox.CommandClientOptions
+import libbox.CommandServer
+import libbox.CommandServerHandler
 import libbox.Libbox
+import libbox.OutboundGroupIterator
+import libbox.StatusMessage
+import libbox.StringIterator
+import libbox.SystemProxyStatus
 import timber.log.Timber
 
 /**
@@ -25,6 +33,7 @@ class LibboxBridge(
     private val mutex = Mutex()
     @Volatile private var box: BoxService? = null
     @Volatile private var platform: LisPlatformInterface? = null
+    @Volatile private var commandServer: CommandServer? = null
 
     /**
      * Validates the supplied [configJson] without actually starting the tunnel.
@@ -55,10 +64,13 @@ class LibboxBridge(
             val newBox = Libbox.newService(configJson, newPlatform)
             box = newBox
             newBox.start()
+            startCommandServer(newBox)
             Timber.i("libbox started, version=%s", Libbox.version())
         }.onFailure {
+            runCatching { commandServer?.close() }
             runCatching { box?.close() }
             platform?.closeTun()
+            commandServer = null
             box = null
             platform = null
             Timber.e(it, "libbox start failed")
@@ -75,13 +87,25 @@ class LibboxBridge(
         runCatching { box?.wake() ?: Unit }
     }
 
+    /** Switches a running selector group without creating another BoxService. */
+    suspend fun selectOutbound(groupTag: String, outboundTag: String): Result<Unit> = mutex.withLock {
+        runCatching {
+            check(box != null) { "BoxService is not running" }
+            runCommandClient(Libbox.CommandSelectOutbound) { client ->
+                client.selectOutbound(groupTag, outboundTag)
+            }
+        }.onFailure { Timber.e(it, "libbox select outbound failed") }
+    }
+
     /** Stops and tears down. Idempotent. */
     suspend fun stop(): Result<Unit> = mutex.withLock {
         runCatching {
             Timber.i("libbox stop requested")
             try {
+                commandServer?.close()
                 box?.close()
             } finally {
+                commandServer = null
                 box = null
                 platform?.closeTun()
                 platform = null
@@ -94,5 +118,64 @@ class LibboxBridge(
 
     private fun ensureInitialized() {
         LibboxEnvironment.ensureInitialized(service)
+    }
+
+    private fun startCommandServer(runningBox: BoxService) {
+        runCatching {
+            val server = Libbox.newCommandServer(NoopCommandServerHandler, COMMAND_LOG_LINES)
+            server.setService(runningBox)
+            server.start()
+            commandServer = server
+            Timber.i("libbox command server started")
+        }.onFailure { Timber.w(it, "libbox command server unavailable; selector switching disabled") }
+    }
+
+    private fun runCommandClient(command: Int, block: (libbox.CommandClient) -> Unit) {
+        runCatching {
+            val client = Libbox.newStandaloneCommandClient()
+            block(client)
+        }.recoverCatching {
+            val options = CommandClientOptions().apply {
+                setCommand(command)
+                setStatusInterval(0L)
+            }
+            val client = Libbox.newCommandClient(NoopCommandClientHandler, options)
+            client.connect()
+            try {
+                block(client)
+            } finally {
+                runCatching { client.disconnect() }
+            }
+        }.getOrThrow()
+    }
+
+    private object NoopCommandServerHandler : CommandServerHandler {
+        override fun getSystemProxyStatus(): SystemProxyStatus =
+            SystemProxyStatus().apply {
+                setAvailable(false)
+                setEnabled(false)
+            }
+
+        override fun serviceReload() = Unit
+        override fun setSystemProxyEnabled(isEnabled: Boolean) = Unit
+    }
+
+    private object NoopCommandClientHandler : CommandClientHandler {
+        override fun clearLog() = Unit
+        override fun connected() = Unit
+        override fun disconnected(message: String?) {
+            if (!message.isNullOrBlank()) Timber.d("libbox command client disconnected: %s", message)
+        }
+        override fun initializeClashMode(modeList: StringIterator?, currentMode: String?) = Unit
+        override fun updateClashMode(newMode: String?) = Unit
+        override fun writeGroups(groups: OutboundGroupIterator?) = Unit
+        override fun writeLog(message: String?) {
+            if (!message.isNullOrBlank()) Timber.tag("libbox-command").d(message)
+        }
+        override fun writeStatus(message: StatusMessage?) = Unit
+    }
+
+    private companion object {
+        const val COMMAND_LOG_LINES = 256
     }
 }

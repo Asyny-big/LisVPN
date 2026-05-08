@@ -68,6 +68,7 @@ class LisVpnService : VpnService() {
             VpnIntents.ACTION_START -> handleStart(intent)
             VpnIntents.ACTION_STOP -> handleStop()
             VpnIntents.ACTION_RECONNECT -> handleReconnect()
+            VpnIntents.ACTION_SELECT_OUTBOUND -> handleSelectOutbound(intent)
             else -> Timber.w("LisVpnService: unknown action %s", intent.action)
         }
         return START_STICKY
@@ -171,6 +172,25 @@ class LisVpnService : VpnService() {
                     Timber.e(err, "libbox manual wake failed")
                     controller.publishError(VpnState.Reason.StartFailed, err.message)
                 }
+        }
+    }
+
+    private fun handleSelectOutbound(intent: Intent) {
+        val groupTag = intent.getStringExtra(VpnIntents.EXTRA_OUTBOUND_GROUP).orEmpty()
+        val outboundTag = intent.getStringExtra(VpnIntents.EXTRA_OUTBOUND_TAG).orEmpty()
+        if (groupTag.isBlank() || outboundTag.isBlank()) {
+            Timber.w("Outbound switch ignored: empty group=%s outbound=%s", groupTag, outboundTag)
+            return
+        }
+        serviceScope?.launch {
+            val runningBridge = bridge
+            if (runningBridge == null || !runningBridge.isRunning()) {
+                Timber.w("Outbound switch ignored: libbox is not running group=%s outbound=%s", groupTag, outboundTag)
+                return@launch
+            }
+            runningBridge.selectOutbound(groupTag, outboundTag)
+                .onSuccess { Timber.i("Outbound switch applied: group=%s outbound=%s", groupTag, outboundTag) }
+                .onFailure { Timber.e(it, "Outbound switch failed: group=%s outbound=%s", groupTag, outboundTag) }
         }
     }
 

@@ -6,27 +6,29 @@ import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Security
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.Transport
-import com.lisvpn.android.core.domain.model.VpnState
+import com.lisvpn.android.core.domain.model.isGeneralVpnEligible
 import com.lisvpn.android.core.domain.model.isVlessFlowSupportedByCurrentLibbox
+import com.lisvpn.android.core.domain.model.specialPurposeReason
+import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
 import com.lisvpn.android.core.domain.repository.ServerHealthRepository
 import com.lisvpn.android.core.domain.repository.ProfileRepository
 import com.lisvpn.android.core.domain.repository.VpnPermissionHandle
 import com.lisvpn.android.core.domain.repository.VpnRepository
 import javax.inject.Inject
 import kotlinx.coroutines.flow.firstOrNull
-import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 
 /**
  * Orchestrates the "Connect" tap:
  *  1. Pull the active profile.
- *  2. Ask [SelectBestServerUseCase] for a ranked subset (urltest will further refine in real time).
+ *  2. In AUTO, pick a stable bootstrap order and optimize inside the running tunnel.
  *  3. Delegate to [VpnRepository.start] with a permission handle supplied by the activity.
  */
 class ConnectVpnUseCase @Inject constructor(
     private val profileRepository: ProfileRepository,
     private val selectBestServer: SelectBestServerUseCase,
     private val serverHealthRepository: ServerHealthRepository,
+    private val autoOptimizerRepository: AutoOptimizerRepository,
     private val vpnRepository: VpnRepository,
 ) {
     suspend operator fun invoke(
@@ -38,18 +40,23 @@ class ConnectVpnUseCase @Inject constructor(
         if (servers.isEmpty()) return AppResult.Failure(AppError.Vpn("No servers available"))
 
         val selected = if (smartSelection) {
-            val stopResult = stopActiveVpnBeforeAutoSpeedTest()
-            if (stopResult != null) return stopResult
             val compatible = servers.filter { it.isSupportedByCurrentLibbox() }
+            val generalCandidates = compatible.filter { it.isGeneralVpnEligible() }
+            val excludedSpecial = compatible.size - generalCandidates.size
             Timber.i(
-                "Auto connect pipeline: before scoring available=%d compatible=%d",
+                "Auto connect pipeline: before scoring available=%d compatible=%d general=%d excludedSpecial=%d",
                 servers.size,
                 compatible.size,
+                generalCandidates.size,
+                excludedSpecial,
             )
             if (compatible.isEmpty()) {
                 return AppResult.Failure(AppError.Vpn("No sing-box compatible VPN servers in subscription"))
             }
-            val ranked = selectBestServer(compatible, limit = SMART_LIMIT)
+            if (generalCandidates.isEmpty()) {
+                return AppResult.Failure(AppError.Vpn("No general-purpose VPN servers in subscription"))
+            }
+            val ranked = selectBestServer(generalCandidates, limit = SMART_LIMIT)
             Timber.i(
                 "Auto connect pipeline: after scoring selectedCount=%d selected=%s",
                 ranked.size,
@@ -63,6 +70,15 @@ class ConnectVpnUseCase @Inject constructor(
                 ?: return AppResult.Failure(AppError.Vpn("Selected server is not available"))
             if (!server.isSupportedByCurrentLibbox()) {
                 return AppResult.Failure(AppError.Vpn("Selected server uses unsupported VLESS transport"))
+            }
+            val specialReason = server.specialPurposeReason()
+            if (specialReason != null) {
+                Timber.w(
+                    "Manual VPN selection rejected: server=%s reason=%s",
+                    server.displayName,
+                    specialReason,
+                )
+                return AppResult.Failure(AppError.Vpn("Selected server is $specialReason and cannot be used as a general VPN"))
             }
             val snapshot = when (val probeResult = serverHealthRepository.probe(server)) {
                 is AppResult.Success -> probeResult.value
@@ -88,37 +104,19 @@ class ConnectVpnUseCase @Inject constructor(
             smartSelection,
             selected.size,
         )
-        return vpnRepository.start(
+        val result = vpnRepository.start(
             servers = selected,
             smartSelection = smartSelection,
             permission = permission,
         )
-    }
-
-    private suspend fun stopActiveVpnBeforeAutoSpeedTest(): AppResult<Unit>? {
-        return when (vpnRepository.state.value) {
-            is VpnState.Connected,
-            is VpnState.Reconnecting -> {
-                Timber.i("Auto speed-test requested while VPN is active; stopping current tunnel before probing")
-                when (val stop = vpnRepository.stop()) {
-                    is AppResult.Failure -> return AppResult.Failure(AppError.Vpn("Could not stop active VPN before AUTO speed test"), stop.cause)
-                    is AppResult.Success -> Unit
-                }
-                val stopped = withTimeoutOrNull(AUTO_STOP_TIMEOUT_MS) {
-                    vpnRepository.state.firstOrNull { state -> state is VpnState.Idle || state is VpnState.Error }
-                } != null
-                if (!stopped) {
-                    AppResult.Failure(AppError.Vpn("Timed out stopping active VPN before AUTO speed test"))
-                } else {
-                    null
-                }
+        if (result is AppResult.Success) {
+            if (smartSelection) {
+                autoOptimizerRepository.schedule(selected)
+            } else {
+                autoOptimizerRepository.cancel()
             }
-            VpnState.Preparing,
-            is VpnState.Connecting,
-            VpnState.Disconnecting -> AppResult.Failure(AppError.Vpn("VPN transition is already in progress"))
-            VpnState.Idle,
-            is VpnState.Error -> null
         }
+        return result
     }
 
     private fun Server.isSupportedByCurrentLibbox(): Boolean =
@@ -146,8 +144,7 @@ class ConnectVpnUseCase @Inject constructor(
         UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX.containsMatchIn(this)
 
     private companion object {
-        const val SMART_LIMIT = 2_000
-        const val AUTO_STOP_TIMEOUT_MS = 5_000L
+        const val SMART_LIMIT = 32
         val UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX = Regex("([?&])type=(xhttp|splithttp)(&|#|$)", RegexOption.IGNORE_CASE)
     }
 }

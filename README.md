@@ -20,7 +20,7 @@ Jetpack Compose, Material 3, Hilt, Ktor, Room. Distributed как APK через
   - `:vpn:core` — `LisVpnService` (foreground, `specialUse`), `VpnConnectionController`,
     `VpnNotifier`, intent-протокол.
   - `:vpn:config` — `VlessUriParser` (включая VLESS Reality из 3x-ui), `SubscriptionDecoder`,
-    `SingBoxConfigBuilder` с `urltest` outbound для smart selection.
+    `SingBoxConfigBuilder` с selector outbound для AUTO.
 - `:core:data` — `VpnRepositoryImpl`, `AppRulesRepositoryImpl` (DataStore), in-memory
   `ProfileRepositoryImpl`, `InstalledAppsRepositoryImpl` (PackageManager).
 - `:core:network` — Ktor 3 + OkHttp + `CertificatePinner` + flavor-aware `NetworkConfig`.
@@ -172,10 +172,11 @@ State flow один — `VpnConnectionController.state: StateFlow<VpnState>`. UI
 
 ### Smart server selection
 
-1. **App-side cold-start ranking** (`SelectBestServerUseCase` + `:vpn:health` Phase 8): берём топ-N
-   серверов по rolling score (latency × success rate × stability).
-2. **Sing-box `urltest` outbound в реальном времени**: каждые 3 минуты пробует `generate_204` и
-   переключает живой канал на лучший. Реализовано в `SingBoxConfigBuilder.kt`.
+1. **Bootstrap connection** (`SelectBestServerUseCase`): быстро выбираем стабильный первый outbound
+   из cache/stable pool и поднимаем один основной `BoxService`.
+2. **Smart optimizer inside VPN** (`AutoOptimizerRepositoryImpl`): после `Connected` переключает
+   существующий selector, меряет throughput, HTTP/DNS RTT, jitter, packet loss, YouTube/Telegram
+   reachability и сохраняет best cache отдельно по типу сети/fingerprint.
 
 ### Split tunneling
 

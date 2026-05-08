@@ -16,7 +16,7 @@ interface VpnRepository {
 
     /**
      * Start the tunnel using the given subset of servers. The implementation is responsible for:
-     *  - Building a sing-box JSON config (with `urltest` if [smartSelection]).
+     *  - Building a sing-box JSON config (with a selector if [smartSelection]).
      *  - Asking for VpnService.prepare() permission via the [VpnPermissionHandle].
      *  - Starting [com.lisvpn.android.vpn.core.LisVpnService] as foreground.
      *
@@ -31,6 +31,9 @@ interface VpnRepository {
 
     /** Graceful teardown. */
     suspend fun stop(): AppResult<Unit>
+
+    /** Switch a running sing-box selector outbound without creating another VPN runtime. */
+    suspend fun selectOutbound(groupTag: String, outboundTag: String): AppResult<Unit>
 
     /**
      * Hard reset of state machine after a fatal error. Does NOT contact libbox.

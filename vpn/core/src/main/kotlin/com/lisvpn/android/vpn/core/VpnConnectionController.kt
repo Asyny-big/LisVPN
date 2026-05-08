@@ -114,6 +114,23 @@ class VpnConnectionController @Inject constructor(
         }.onFailure { Timber.e(it, "VpnConnectionController.reconnect failed") }
     }
 
+    suspend fun selectOutbound(groupTag: String, outboundTag: String): Result<Unit> = mutex.withLock {
+        val current = _state.value
+        if (current !is VpnState.Connected && current !is VpnState.Reconnecting) {
+            return Result.failure(IllegalStateException("VPN is not connected"))
+        }
+        Timber.i("VPN outbound switch requested: group=%s outbound=%s", groupTag, outboundTag)
+        runCatching {
+            val intent = Intent(context, LisVpnService::class.java).apply {
+                action = VpnIntents.ACTION_SELECT_OUTBOUND
+                putExtra(VpnIntents.EXTRA_OUTBOUND_GROUP, groupTag)
+                putExtra(VpnIntents.EXTRA_OUTBOUND_TAG, outboundTag)
+            }
+            context.startService(intent)
+            Unit
+        }.onFailure { Timber.e(it, "VpnConnectionController.selectOutbound failed") }
+    }
+
     fun acknowledgeError() {
         _state.value = VpnState.Idle
     }
