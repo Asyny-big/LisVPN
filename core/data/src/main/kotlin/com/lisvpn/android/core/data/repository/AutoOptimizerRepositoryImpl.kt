@@ -8,6 +8,7 @@ import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.VpnState
 import com.lisvpn.android.core.domain.model.isGeneralVpnEligible
 import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
+import com.lisvpn.android.core.domain.repository.AutoOptimizerStatus
 import com.lisvpn.android.core.domain.repository.ServerHealthRepository
 import com.lisvpn.android.core.domain.repository.VpnRepository
 import java.io.BufferedInputStream
@@ -22,6 +23,9 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -44,9 +48,12 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
 
     private val mutex = Mutex()
     private var optimizerJob: Job? = null
+    private val _status = MutableStateFlow<AutoOptimizerStatus>(AutoOptimizerStatus.Idle)
+    override val status: StateFlow<AutoOptimizerStatus> = _status.asStateFlow()
 
     override fun schedule(servers: List<Server>) {
         optimizerJob?.cancel()
+        _status.value = AutoOptimizerStatus.Idle
         if (servers.size <= 1) {
             Timber.i("Auto optimizer skipped: only one server")
             return
@@ -58,6 +65,7 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
                 }
                 if (connected == null) {
                     Timber.w("Auto optimizer skipped: VPN did not reach connected state")
+                    _status.value = AutoOptimizerStatus.Failed("VPN did not connect in time")
                     return@launch
                 }
                 delay(POST_CONNECT_WARMUP_MS)
@@ -66,6 +74,7 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
                 throw e
             } catch (e: Throwable) {
                 Timber.w(e, "Auto optimizer failed")
+                _status.value = AutoOptimizerStatus.Failed(e.message ?: "optimizer crashed")
             }
         }
     }
@@ -73,6 +82,7 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
     override fun cancel() {
         optimizerJob?.cancel()
         optimizerJob = null
+        _status.value = AutoOptimizerStatus.Idle
     }
 
     private suspend fun optimize(servers: List<Server>) = mutex.withLock {
@@ -84,9 +94,11 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
                 .filter { it.server.isGeneralVpnEligible() }
             if (indexedServers.isEmpty()) {
                 Timber.w("Auto optimizer skipped: no general-purpose candidates")
+                _status.value = AutoOptimizerStatus.Failed("no candidates")
                 return@withContext
             }
             val candidates = selectOptimizationCandidates(indexedServers, profile, cachedServerIds)
+            val totalToTest = candidates.size
             val originalTag = indexedServers.first().outboundTag
             var optimizerTag = originalTag
             val results = mutableListOf<ScoredTunnelCandidate>()
@@ -99,12 +111,20 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
                 candidates.joinToString { it.server.displayName },
             )
 
-            for (candidate in candidates) {
+            for ((index, candidate) in candidates.withIndex()) {
                 if (vpnRepository.state.value !is VpnState.Connected) {
                     Timber.i("Auto optimizer stopped: VPN is no longer connected")
                     break
                 }
                 val tag = candidate.outboundTag
+                val previousResult = results.lastOrNull()
+                _status.value = AutoOptimizerStatus.Probing(
+                    current = index + 1,
+                    total = totalToTest,
+                    serverDisplayName = candidate.server.displayName,
+                    lastSpeedKbps = previousResult?.probe?.throughputBytesPerSecond?.toKbps(),
+                    lastServerDisplayName = previousResult?.server?.displayName,
+                )
                 val switchStartedAt = SystemClock.elapsedRealtime()
                 val switched = vpnRepository.selectOutbound(AUTO_OPTIMIZER_SELECTOR_TAG, tag)
                 if (switched is com.lisvpn.android.core.common.result.AppResult.Failure) {
@@ -154,11 +174,17 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
             if (best == null) {
                 if (optimizerTag != originalTag) vpnRepository.selectOutbound(AUTO_OPTIMIZER_SELECTOR_TAG, originalTag)
                 Timber.w("Auto optimizer finished: no successful candidate; kept live bootstrap=%s", originalTag)
+                _status.value = AutoOptimizerStatus.Failed("no successful probe")
                 return@withContext
             }
 
             vpnRepository.selectOutbound(AUTO_SELECTOR_TAG, best.outboundTag)
             autoServerPreferenceStore.saveBest(profile, best.server, best.score)
+            _status.value = AutoOptimizerStatus.Done(
+                bestServerDisplayName = best.server.displayName,
+                bestSpeedKbps = best.probe.throughputBytesPerSecond?.toKbps(),
+                tested = results.size,
+            )
             Timber.i(
                 "Auto optimizer finished: best=%s tag=%s score=%d network=%s metrics=%s",
                 best.server.displayName,
@@ -169,6 +195,8 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
             )
         }
     }
+
+    private fun Long.toKbps(): Long = this * 8L / 1_000L
 
     private fun selectOptimizationCandidates(
         indexedServers: List<OptimizationCandidate>,
@@ -327,13 +355,16 @@ class AutoOptimizerRepositoryImpl @Inject constructor(
         const val AUTO_SELECTOR_TAG = "auto"
         const val AUTO_OPTIMIZER_SELECTOR_TAG = "auto-optimizer"
         const val CONNECTED_WAIT_TIMEOUT_MS = 20_000L
-        const val POST_CONNECT_WARMUP_MS = 2_000L
-        const val CANDIDATE_WARMUP_MS = 700L
-        // Each in-tunnel probe now downloads ~2 MiB to capture real bandwidth, so we give it
-        // more headroom than the previous 12 s budget allowed.
-        const val CANDIDATE_PROBE_TIMEOUT_MS = 18_000L
-        const val OPTIMIZER_CANDIDATE_LIMIT = 12
-        const val SPREAD_CANDIDATE_COUNT = 5
+        const val POST_CONNECT_WARMUP_MS = 1_500L
+        const val CANDIDATE_WARMUP_MS = 500L
+        // Each in-tunnel probe downloads ~2 MiB to capture real bandwidth (slow-start dominates
+        // anything smaller). 10 s gives every candidate enough budget to finish, but still keeps
+        // the per-server step short enough for the UI progress indicator to feel responsive.
+        const val CANDIDATE_PROBE_TIMEOUT_MS = 10_000L
+        // We reduced the candidate cap from 12 to 6 — past six servers the user has long since
+        // assumed the test is done and the optimiser was effectively running in the dark.
+        const val OPTIMIZER_CANDIDATE_LIMIT = 6
+        const val SPREAD_CANDIDATE_COUNT = 4
         // 50 Mbps is a more realistic upper bound for a fast residential VPN; the old 3 Mbps cap
         // saturated the throughput component for almost every server, which silently neutralised
         // its weight in the optimiser score.

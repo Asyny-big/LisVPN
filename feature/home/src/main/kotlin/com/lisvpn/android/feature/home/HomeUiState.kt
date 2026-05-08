@@ -4,7 +4,6 @@ import com.lisvpn.android.core.designsystem.component.StatusOrbState
 import com.lisvpn.android.core.domain.model.Outbound
 import com.lisvpn.android.core.domain.model.Server
 import com.lisvpn.android.core.domain.model.VpnState
-import com.lisvpn.android.core.domain.model.isGeneralVpnEligible
 
 /**
  * Immutable view-model state for the Home screen.
@@ -23,7 +22,22 @@ data class HomeUiState(
     val connectionMode: HomeConnectionMode,
     val servers: List<HomeServerOption>,
     val statusMessage: String? = null,
+    val optimizer: AutoOptimizerUiStatus = AutoOptimizerUiStatus.Idle,
 ) {
+
+    fun withOptimizerStatus(status: AutoOptimizerUiStatus): HomeUiState {
+        if (status == optimizer) return this
+        // The orb / canConnect / canDisconnect are already determined by the underlying VPN
+        // state. We only ever overlay a subtitle line so the user can see the speed test
+        // progressing while the VPN reports "Connected".
+        val statusLine = status.toSubtitleLine()
+        val nextSubtitle = if (statusLine != null && orb == StatusOrbState.Connected) {
+            statusLine
+        } else {
+            subtitle
+        }
+        return copy(optimizer = status, subtitle = nextSubtitle)
+    }
     companion object {
         val Empty = HomeUiState(
             orb = StatusOrbState.Idle,
@@ -47,14 +61,17 @@ data class HomeUiState(
             connectionMode: HomeConnectionMode,
             selectedServerId: String?,
         ): HomeUiState {
-            val manualServers = allServers.filter { it.isGeneralVpnEligible() }
-            val selected = manualServers.firstOrNull { it.id == selectedServerId }
+            // Show every parsed server in the manual list. The previous "Telegram-only" name
+            // heuristic was filtering out perfectly usable VPN entries (the user reported the
+            // 🇪🇪 Эстония Telegram server missing from the list while the same subscription
+            // showed it in other clients).
+            val selected = allServers.firstOrNull { it.id == selectedServerId }
             val hasServers = allServers.isNotEmpty()
             val base = Empty.copy(
                 activeProfileName = profileName,
                 activeServerCount = allServers.size,
                 connectionMode = connectionMode,
-                servers = manualServers.map { server ->
+                servers = allServers.map { server ->
                     HomeServerOption(
                         id = server.id,
                         title = server.displayName,
@@ -134,6 +151,67 @@ data class HomeServerOption(
     val subtitle: String,
     val selected: Boolean,
 )
+
+/**
+ * Lightweight UI projection of the in-tunnel optimizer's progress so the Home screen can show
+ * the user that we are *actually* download-speed-testing each candidate server through the
+ * tunnel — previously the optimiser ran silently in the background and the user reasonably
+ * concluded that no real speed test ever happened.
+ */
+sealed interface AutoOptimizerUiStatus {
+    data object Idle : AutoOptimizerUiStatus
+
+    data class Probing(
+        val current: Int,
+        val total: Int,
+        val serverDisplayName: String,
+        val lastSpeedKbps: Long?,
+        val lastServerDisplayName: String?,
+    ) : AutoOptimizerUiStatus
+
+    data class Done(
+        val bestServerDisplayName: String,
+        val bestSpeedKbps: Long?,
+        val tested: Int,
+    ) : AutoOptimizerUiStatus
+}
+
+fun AutoOptimizerUiStatus.toSubtitleLine(): String? = when (this) {
+    AutoOptimizerUiStatus.Idle -> null
+    is AutoOptimizerUiStatus.Probing -> buildString {
+        append("Тест скорости ")
+        append(current)
+        append('/')
+        append(total)
+        append(" · ")
+        append(serverDisplayName)
+        val lastSpeed = lastSpeedKbps
+        val lastName = lastServerDisplayName
+        if (lastSpeed != null && lastName != null) {
+            append(" (")
+            append(lastName)
+            append(": ")
+            append(formatKbps(lastSpeed))
+            append(')')
+        }
+    }
+    is AutoOptimizerUiStatus.Done -> buildString {
+        append("Лучший: ")
+        append(bestServerDisplayName)
+        bestSpeedKbps?.let {
+            append(" · ")
+            append(formatKbps(it))
+        }
+        append(" (тест ")
+        append(tested)
+        append(" серверов)")
+    }
+}
+
+private fun formatKbps(kbps: Long): String = when {
+    kbps >= 1_000L -> "${"%.1f".format(kbps / 1_000.0)} Мбит/с"
+    else -> "$kbps кбит/с"
+}
 
 private fun Server.uiSubtitle(): String = listOfNotNull(
     countryCode?.uppercase(),

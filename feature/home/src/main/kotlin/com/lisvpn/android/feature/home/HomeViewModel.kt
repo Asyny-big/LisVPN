@@ -3,6 +3,8 @@ package com.lisvpn.android.feature.home
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lisvpn.android.core.common.result.AppResult
+import com.lisvpn.android.core.domain.repository.AutoOptimizerRepository
+import com.lisvpn.android.core.domain.repository.AutoOptimizerStatus
 import com.lisvpn.android.core.domain.repository.ProfileRepository
 import com.lisvpn.android.core.domain.repository.VpnPermissionHandle
 import com.lisvpn.android.core.domain.usecase.ConnectVpnUseCase
@@ -23,6 +25,7 @@ import timber.log.Timber
 class HomeViewModel @Inject constructor(
     observeVpnState: ObserveVpnStateUseCase,
     profileRepository: ProfileRepository,
+    autoOptimizer: AutoOptimizerRepository,
     private val connectVpn: ConnectVpnUseCase,
     private val disconnectVpn: DisconnectVpnUseCase,
 ) : ViewModel() {
@@ -32,6 +35,7 @@ class HomeViewModel @Inject constructor(
     private val connectionMode = MutableStateFlow(HomeConnectionMode.Auto)
     private val selectedServerId = MutableStateFlow<String?>(null)
     private val _statusMessage = MutableStateFlow<String?>(null)
+    private val optimizerStatus = autoOptimizer.status
 
     val uiState: StateFlow<HomeUiState> = combine(
         observeVpnState(),
@@ -43,6 +47,8 @@ class HomeViewModel @Inject constructor(
         HomeUiState.from(vpn, profile?.name, servers, mode, selectedId)
     }.combine(_statusMessage) { state, msg ->
         state.copy(statusMessage = msg)
+    }.combine(optimizerStatus) { state, optimizer ->
+        state.withOptimizerStatus(optimizer.toUiStatus())
     }.stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(STATE_TIMEOUT_MS),
@@ -112,4 +118,21 @@ class HomeViewModel @Inject constructor(
     private companion object {
         const val STATE_TIMEOUT_MS = 5_000L
     }
+}
+
+private fun AutoOptimizerStatus.toUiStatus(): AutoOptimizerUiStatus = when (this) {
+    is AutoOptimizerStatus.Idle -> AutoOptimizerUiStatus.Idle
+    is AutoOptimizerStatus.Probing -> AutoOptimizerUiStatus.Probing(
+        current = current,
+        total = total,
+        serverDisplayName = serverDisplayName,
+        lastSpeedKbps = lastSpeedKbps,
+        lastServerDisplayName = lastServerDisplayName,
+    )
+    is AutoOptimizerStatus.Done -> AutoOptimizerUiStatus.Done(
+        bestServerDisplayName = bestServerDisplayName,
+        bestSpeedKbps = bestSpeedKbps,
+        tested = tested,
+    )
+    is AutoOptimizerStatus.Failed -> AutoOptimizerUiStatus.Idle
 }
