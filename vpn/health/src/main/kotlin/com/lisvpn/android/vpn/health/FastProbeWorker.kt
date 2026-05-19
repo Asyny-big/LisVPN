@@ -1,10 +1,14 @@
 package com.lisvpn.android.vpn.health
 
+import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.SystemClock
 import android.os.Build
 import com.lisvpn.android.core.common.dispatchers.IoDispatcher
 import com.lisvpn.android.core.domain.model.Security
 import com.lisvpn.android.core.domain.model.Server
+import dagger.hilt.android.qualifiers.ApplicationContext
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -28,11 +32,18 @@ import timber.log.Timber
 
 @Singleton
 class FastProbeWorker @Inject constructor(
+    @ApplicationContext private val context: Context,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
 ) {
 
     suspend fun probeAll(servers: List<TaggedServer>): List<FastProbeResult> = withContext(ioDispatcher) {
-        val semaphore = Semaphore(FAST_PROBE_PARALLELISM)
+        // Mobile carriers (especially Russian ones on a whitelisted IP plan) tend to NAT-collapse
+        // or throttle bursts of parallel TLS handshakes from the same device, which the
+        // hard-coded `FAST_PROBE_PARALLELISM = 12` used to provoke — we'd lose 4-5 healthy servers
+        // to spurious "timeout" results on every connect. Halving the parallelism on mobile-like
+        // networks fixes that without slowing down Wi-Fi/Ethernet users.
+        val parallelism = if (isMobileLikeNetwork()) FAST_PROBE_PARALLELISM_MOBILE else FAST_PROBE_PARALLELISM_FIXED
+        val semaphore = Semaphore(parallelism)
         coroutineScope {
             servers.map { tagged ->
                 async {
@@ -161,8 +172,36 @@ class FastProbeWorker @Inject constructor(
     private fun Throwable.shortReason(): String =
         "${this::class.java.simpleName}: ${message.orEmpty()}".take(96)
 
+    private fun isMobileLikeNetwork(): Boolean {
+        val manager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return false
+        val active = manager.activeNetwork ?: return false
+        val caps = manager.getNetworkCapabilities(active) ?: return false
+        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            // If the VPN we're probing for is already up (rare during fast probe but possible on
+            // reconnect), fall back to scanning the other networks to figure out the underlying
+            // transport.
+            return manager.allNetworks
+                .asSequence()
+                .mapNotNull(manager::getNetworkCapabilities)
+                .filter { !it.hasTransport(NetworkCapabilities.TRANSPORT_VPN) }
+                .any { it.isMobileLike() }
+        }
+        return caps.isMobileLike()
+    }
+
+    private fun NetworkCapabilities.isMobileLike(): Boolean {
+        if (hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return true
+        if (hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+            return false
+        }
+        // Metered without an explicit known transport — treat as mobile-like.
+        return !hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+    }
+
     private companion object {
-        const val FAST_PROBE_PARALLELISM = 12
+        const val FAST_PROBE_PARALLELISM_FIXED = 12
+        const val FAST_PROBE_PARALLELISM_MOBILE = 6
         const val FAST_PROBE_TOTAL_TIMEOUT_MS = 2_200L
         const val TCP_CONNECT_TIMEOUT_MS = 1_500
         const val SOCKET_READ_TIMEOUT_MS = 1_500

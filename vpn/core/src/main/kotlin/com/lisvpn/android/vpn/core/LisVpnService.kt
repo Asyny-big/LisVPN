@@ -791,10 +791,19 @@ class LisVpnService : VpnService() {
         const val RECONNECT_MAX_DELAY_MS = 30_000L
         const val RECONNECT_JITTER_MS = 1_500L
         const val RECONNECT_MAX_EXPONENT = 5
-        const val AUTO_SHORTLIST_LIMIT = 8
-        const val AUTO_TUNNEL_VALIDATION_LIMIT = 4
-        const val AUTO_MIN_TESTED_AFTER_SUCCESS = 3
-        const val AUTO_GOOD_ENOUGH_SPEED_KBPS = 1_500L
+        const val AUTO_SHORTLIST_LIMIT = 12
+        // We test up to 6 servers (was 4) so a single bad first pick can't dominate the result on
+        // mobile / whitelist networks where the first reachable candidate often shows artificially
+        // low speed because of DPI throttling on the speed-test endpoint.
+        const val AUTO_TUNNEL_VALIDATION_LIMIT = 6
+        // Require at least 5 candidates tested before short-circuiting (was 3). Combined with the
+        // higher good-enough threshold this guarantees we sample enough of the shortlist to find
+        // a really fast server rather than stopping at the first "barely OK" one.
+        const val AUTO_MIN_TESTED_AFTER_SUCCESS = 5
+        // Only short-circuit on >= 8 Mbps (was 1.5 Mbps). A 1.5 Mbps server is "alive" but it is
+        // not "fast" — that was the previous bug that made AUTO settle for the first usable server
+        // instead of the actually fastest one.
+        const val AUTO_GOOD_ENOUGH_SPEED_KBPS = 8_000L
         const val MANUAL_VALIDATION_WARMUP_MS = 1_200L
         const val FIRST_SELECTOR_SWITCH_WARMUP_MS = 1_800L
         const val SELECTOR_SWITCH_WARMUP_MS = 1_000L

@@ -28,10 +28,16 @@ class TunnelValidationWorker @Inject constructor(
 ) {
 
     suspend fun validate(serverId: String): TunnelValidationResult =
+        // AUTO mode used to require ALL targets to succeed. That broke on Russian mobile networks
+        // where DPI/whitelisting frequently blocks one of cloudflare/1.1.1.1/youtube even when the
+        // server itself is fully usable — the server was wrongly marked ineligible and never got
+        // a speed test. We now require DNS + at least AUTO_MIN_SUCCESSFUL_TARGETS targets to pass,
+        // out of a wider, more DPI-diverse probe set (cloudflare, google, telegram, yandex, mail).
         validateTargets(
             serverId = serverId,
             targets = VALIDATION_TARGETS,
-            requireAllTargets = true,
+            requireAllTargets = false,
+            minSuccessfulTargets = AUTO_MIN_SUCCESSFUL_TARGETS,
         )
 
     suspend fun validateManual(serverId: String): TunnelValidationResult =
@@ -41,12 +47,14 @@ class TunnelValidationWorker @Inject constructor(
             serverId = serverId,
             targets = MANUAL_VALIDATION_TARGETS,
             requireAllTargets = false,
+            minSuccessfulTargets = 1,
         )
 
     private suspend fun validateTargets(
         serverId: String,
         targets: List<ValidationTarget>,
         requireAllTargets: Boolean,
+        minSuccessfulTargets: Int = 1,
     ): TunnelValidationResult = withContext(ioDispatcher) {
         val startedAt = SystemClock.elapsedRealtime()
         val network = waitForVpnNetwork() ?: return@withContext TunnelValidationResult.failed(
@@ -74,9 +82,15 @@ class TunnelValidationWorker @Inject constructor(
                 }
             }.awaitAll()
         }
+        val successfulCount = checks.count { it.success }
         val allHttpOk = checks.isNotEmpty() && checks.all { it.success }
         val anyHttpOk = checks.any { it.success }
-        val eligible = dnsWorks && if (requireAllTargets) allHttpOk else anyHttpOk
+        val httpEligible = when {
+            requireAllTargets -> allHttpOk
+            minSuccessfulTargets > 1 -> successfulCount >= minSuccessfulTargets
+            else -> anyHttpOk
+        }
+        val eligible = dnsWorks && httpEligible
         TunnelValidationResult(
             serverId = serverId,
             vpnNetworkSeen = true,
@@ -209,6 +223,10 @@ class TunnelValidationWorker @Inject constructor(
             HEALTH_TARGET,
             TELEGRAM_TARGET,
         )
+        // Wider, DPI-diverse target set so AUTO validation does not fail entirely when one or two
+        // of the targets are blocked by a carrier whitelist. We mix big-tech (cloudflare/google) and
+        // RU-friendly endpoints (yandex/mail) so at least 2 of these always answer on any working
+        // server, no matter which side of the whitelist the user is on.
         val VALIDATION_TARGETS = listOf(
             HEALTH_TARGET,
             ValidationTarget(
@@ -216,12 +234,31 @@ class TunnelValidationWorker @Inject constructor(
                 url = "https://1.1.1.1/cdn-cgi/trace",
                 readBody = true,
             ),
+            ValidationTarget(
+                name = "google204",
+                url = "https://www.google.com/generate_204",
+                accepts = { it == 204 || it in 200..399 },
+            ),
             TELEGRAM_TARGET,
             ValidationTarget(
                 name = "youtube",
                 url = "https://www.youtube.com/generate_204",
                 accepts = { it == 204 || it in 200..399 },
             ),
+            ValidationTarget(
+                name = "yandex",
+                url = "https://yandex.ru/favicon.ico",
+                accepts = { it in 200..399 },
+            ),
+            ValidationTarget(
+                name = "mailru",
+                url = "https://mail.ru/favicon.ico",
+                accepts = { it in 200..399 },
+            ),
         )
+        // Out of the diverse target set we only need 2 successes to consider the tunnel usable.
+        // This survives a single DPI block (e.g. only cloudflare is blocked) without dropping a
+        // healthy server.
+        const val AUTO_MIN_SUCCESSFUL_TARGETS = 2
     }
 }
