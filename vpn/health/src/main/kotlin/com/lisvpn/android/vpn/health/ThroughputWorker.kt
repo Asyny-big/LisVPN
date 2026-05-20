@@ -16,7 +16,19 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import timber.log.Timber
 
+/**
+ * Measures real download throughput through the live VPN tunnel.
+ *
+ * Why this is non-trivial on Russian mobile + whitelist networks:
+ *  - speed.cloudflare.com is frequently DPI-throttled or blocked by carriers, so a single endpoint
+ *    can return 0 bytes/s for a perfectly healthy server. We now try several CDNs in order and
+ *    take the first one that delivers a meaningful sample.
+ *  - A 200 KB sample (the previous default) is too small to escape TCP slow-start, so even a fast
+ *    server reports a slow rate. We download up to 1 MiB now, but stop early once we have enough
+ *    bytes within a budget so the overall AUTO selection latency stays bounded.
+ */
 @Singleton
 class ThroughputWorker @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -32,24 +44,63 @@ class ThroughputWorker @Inject constructor(
             mbps = null,
             error = "vpn network not visible",
         )
-        withTimeoutOrNull(TOTAL_TIMEOUT_MS) {
-            measureOn(network)
-        } ?: ThroughputResult(
+
+        val measurementStartedAt = SystemClock.elapsedRealtime()
+        var lastError: String? = null
+        for (endpoint in SPEED_ENDPOINTS) {
+            val elapsedSoFar = SystemClock.elapsedRealtime() - measurementStartedAt
+            val remainingBudget = TOTAL_MEASUREMENT_BUDGET_MS - elapsedSoFar
+            if (remainingBudget <= MIN_REMAINING_BUDGET_MS) break
+            val perEndpointTimeout = remainingBudget.coerceAtMost(endpoint.totalTimeoutMs)
+            val attempt = withTimeoutOrNull(perEndpointTimeout) {
+                measureOn(network, endpoint)
+            } ?: ThroughputResult(
+                success = false,
+                bytesRead = 0L,
+                elapsedMs = null,
+                firstByteMs = null,
+                mbps = null,
+                error = "timeout",
+            )
+            // We only accept a measurement that downloaded enough bytes to escape TCP slow-start.
+            // Anything below MIN_USEFUL_BYTES (256 KB) is treated as a probe failure so we move on
+            // to the next CDN instead of recording a misleadingly tiny "speed".
+            if (attempt.success && attempt.bytesRead >= MIN_USEFUL_BYTES) {
+                if (endpoint != SPEED_ENDPOINTS.first()) {
+                    Timber.i(
+                        "Throughput fallback used: endpoint=%s bytes=%d mbps=%s",
+                        endpoint.url,
+                        attempt.bytesRead,
+                        attempt.mbps,
+                    )
+                }
+                return@withContext attempt
+            }
+            lastError = attempt.error
+                ?: if (attempt.success) "sample too small (${attempt.bytesRead} bytes)" else "unknown"
+            Timber.w(
+                "Throughput endpoint failed: endpoint=%s bytes=%d error=%s",
+                endpoint.url,
+                attempt.bytesRead,
+                lastError,
+            )
+        }
+        ThroughputResult(
             success = false,
             bytesRead = 0L,
             elapsedMs = null,
             firstByteMs = null,
             mbps = null,
-            error = "timeout",
+            error = lastError ?: "all speed endpoints failed",
         )
     }
 
-    private fun measureOn(network: Network): ThroughputResult {
+    private fun measureOn(network: Network, endpoint: SpeedEndpoint): ThroughputResult {
         val startedAt = SystemClock.elapsedRealtime()
         var bytes = 0L
         var firstByteMs: Int? = null
         return runCatching {
-            val connection = (network.openConnection(URL(SPEED_URL)) as HttpURLConnection).apply {
+            val connection = (network.openConnection(URL(endpoint.url)) as HttpURLConnection).apply {
                 requestMethod = "GET"
                 connectTimeout = CONNECT_TIMEOUT_MS
                 readTimeout = READ_TIMEOUT_MS
@@ -70,8 +121,16 @@ class ThroughputWorker @Inject constructor(
                 }
                 BufferedInputStream(connection.inputStream).use { input ->
                     val buffer = ByteArray(BUFFER_SIZE)
-                    while (bytes < MAX_DOWNLOAD_BYTES) {
-                        val read = input.read(buffer, 0, minOf(buffer.size, (MAX_DOWNLOAD_BYTES - bytes).toInt()))
+                    val budgetMs = endpoint.downloadBudgetMs
+                    val maxBytes = endpoint.maxBytes
+                    while (bytes < maxBytes) {
+                        val elapsedNow = SystemClock.elapsedRealtime() - startedAt
+                        // Cap on wall time so a single endpoint can never blow past its budget,
+                        // even if it keeps trickling bytes very slowly. We still accept whatever
+                        // we managed to download as the measurement.
+                        if (elapsedNow >= budgetMs && bytes >= MIN_USEFUL_BYTES) break
+                        val remaining = minOf(buffer.size.toLong(), maxBytes - bytes).toInt()
+                        val read = input.read(buffer, 0, remaining)
                         if (read <= 0) break
                         if (firstByteMs == null) firstByteMs = elapsedSince(startedAt)
                         bytes += read
@@ -114,13 +173,52 @@ class ThroughputWorker @Inject constructor(
     private fun elapsedSince(startedAt: Long): Int =
         (SystemClock.elapsedRealtime() - startedAt).toInt().coerceAtLeast(1)
 
+    private data class SpeedEndpoint(
+        val url: String,
+        val maxBytes: Long,
+        val downloadBudgetMs: Long,
+        val totalTimeoutMs: Long,
+    )
+
     private companion object {
         const val USER_AGENT = "LisVPN/MiniSpeed"
-        const val SPEED_URL = "https://speed.cloudflare.com/__down?bytes=200000"
-        const val MAX_DOWNLOAD_BYTES = 200_000L
-        const val BUFFER_SIZE = 16 * 1024
+        const val BUFFER_SIZE = 32 * 1024
         const val CONNECT_TIMEOUT_MS = 3_000
         const val READ_TIMEOUT_MS = 5_000
-        const val TOTAL_TIMEOUT_MS = 7_000L
+        const val MIN_USEFUL_BYTES = 256L * 1024L
+        // Total wall-clock cap for the entire measurement, including all fallbacks. Even if every
+        // endpoint times out we will not block AUTO selection longer than this.
+        const val TOTAL_MEASUREMENT_BUDGET_MS = 9_000L
+        const val MIN_REMAINING_BUDGET_MS = 500L
+
+        // Ordered list of speed endpoints to try. The first that returns a meaningful sample wins.
+        // We mix global big-tech CDNs (cloudflare/google/microsoft) with Russian-friendly mirrors
+        // so AUTO mode can always find at least one working endpoint regardless of which side of a
+        // carrier whitelist the user is on.
+        val SPEED_ENDPOINTS = listOf(
+            SpeedEndpoint(
+                url = "https://speed.cloudflare.com/__down?bytes=1048576",
+                maxBytes = 1_048_576L,
+                downloadBudgetMs = 3_500L,
+                totalTimeoutMs = 5_000L,
+            ),
+            SpeedEndpoint(
+                // Hetzner public download mirror — extremely well peered globally and very rarely
+                // hit by DPI in Russia.
+                url = "https://hil-speed.hetzner.com/100MB.bin",
+                maxBytes = 1_048_576L,
+                downloadBudgetMs = 3_000L,
+                totalTimeoutMs = 4_000L,
+            ),
+            SpeedEndpoint(
+                // Yandex's public package mirror is whitelisted on virtually every Russian carrier,
+                // so even when cloudflare and hetzner are DPI-zeroed this endpoint still reports a
+                // real throughput sample.
+                url = "https://mirror.yandex.ru/ubuntu/ls-lR.gz",
+                maxBytes = 1_048_576L,
+                downloadBudgetMs = 3_000L,
+                totalTimeoutMs = 4_000L,
+            ),
+        )
     }
 }

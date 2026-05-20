@@ -3,13 +3,11 @@ package com.lisvpn.android.vpn.health
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.net.wifi.WifiManager
 import android.telephony.TelephonyManager
 import com.lisvpn.android.core.common.dispatchers.IoDispatcher
 import com.lisvpn.android.core.database.dao.SmartServerCacheDao
 import com.lisvpn.android.core.database.entity.SmartServerCacheEntity
 import dagger.hilt.android.qualifiers.ApplicationContext
-import java.security.MessageDigest
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CoroutineDispatcher
@@ -87,16 +85,25 @@ class SmartServerCache @Inject constructor(
         }
         val metered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
         val carrier = context.telephonyCarrierName()
+        // We deliberately keep fingerprints coarse:
+        //   - All cellular networks share one bucket ("mobile") regardless of the carrier name.
+        //   - All Wi-Fi networks share one bucket ("wifi") regardless of SSID.
+        // Previously we keyed history per-SSID and per-carrier, which meant moving from home Wi-Fi
+        // to a coffee-shop Wi-Fi, or roaming to a different carrier, wiped the AUTO cache and
+        // started over from a blank slate. Server peering varies far less than network identity, so
+        // re-using one mobile / one wifi cache is dramatically more useful and avoids cold-starting
+        // AUTO selection every time the user switches networks. We still split mobile vs wifi vs
+        // ethernet because their throughput / RTT profiles are genuinely different.
         return when {
             caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> SmartNetworkProfile(
                 networkClass = SmartNetworkClass.Mobile,
-                fingerprint = "mobile:${carrier.ifBlank { "unknown" }}".safeFingerprint(),
+                fingerprint = "mobile",
                 mobileOperator = carrier.ifBlank { null },
                 asn = null,
             )
             caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> SmartNetworkProfile(
                 networkClass = SmartNetworkClass.Wifi,
-                fingerprint = "wifi:${if (metered) "metered" else "unmetered"}:${context.wifiFingerprintPart().ifBlank { "unknown" }}".safeFingerprint(),
+                fingerprint = if (metered) "wifi-metered" else "wifi",
                 mobileOperator = null,
                 asn = null,
             )
@@ -144,25 +151,11 @@ class SmartServerCache @Inject constructor(
                 .normalizeFingerprintPart()
         }.getOrDefault("")
 
-    private fun Context.wifiFingerprintPart(): String =
-        runCatching {
-            val manager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            manager?.connectionInfo?.ssid
-                .orEmpty()
-                .trim('"')
-                .normalizeFingerprintPart()
-        }.getOrDefault("")
-
     private fun String.normalizeFingerprintPart(): String =
         lowercase()
             .replace(Regex("[^a-z0-9._-]+"), "-")
             .trim('-')
             .take(64)
-
-    private fun String.safeFingerprint(): String =
-        MessageDigest.getInstance("SHA-1")
-            .digest(toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
 
     private fun NetworkCapabilities.profilePriority(): Int {
         val validation = if (hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) 100 else 0

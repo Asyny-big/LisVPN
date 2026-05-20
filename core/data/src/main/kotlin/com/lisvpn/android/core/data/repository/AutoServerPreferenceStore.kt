@@ -3,8 +3,6 @@ package com.lisvpn.android.core.data.repository
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
-import android.net.wifi.WifiManager
-import android.telephony.TelephonyManager
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
@@ -76,17 +74,16 @@ class AutoServerPreferenceStore @Inject constructor(
         }
 
         val metered = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED) == false
+        // Fingerprints are intentionally coarse so the AUTO cache survives Wi-Fi switches and
+        // carrier changes — see SmartServerCache.detectNetworkProfile for the same rationale.
         return when {
-            caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> {
-                val carrier = context.telephonyCarrierName()
-                AutoNetworkProfile(
-                    networkClass = AutoNetworkClass.Mobile,
-                    fingerprint = "mobile:${carrier.ifBlank { "unknown" }}",
-                )
-            }
+            caps?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true -> AutoNetworkProfile(
+                networkClass = AutoNetworkClass.Mobile,
+                fingerprint = "mobile",
+            )
             caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true -> AutoNetworkProfile(
                 networkClass = AutoNetworkClass.Wifi,
-                fingerprint = "wifi:${if (metered) "metered" else "unmetered"}:${context.wifiFingerprintPart().ifBlank { "unknown" }}",
+                fingerprint = if (metered) "wifi-metered" else "wifi",
             )
             caps?.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) == true -> AutoNetworkProfile(
                 networkClass = AutoNetworkClass.Ethernet,
@@ -102,30 +99,6 @@ class AutoServerPreferenceStore @Inject constructor(
             )
         }
     }
-
-    private fun Context.telephonyCarrierName(): String =
-        runCatching {
-            val manager = getSystemService(Context.TELEPHONY_SERVICE) as? TelephonyManager
-            listOf(manager?.networkOperator.orEmpty(), manager?.networkOperatorName.orEmpty())
-                .filter { it.isNotBlank() }
-                .joinToString("-")
-                .normalizeFingerprintPart()
-        }.getOrDefault("")
-
-    private fun Context.wifiFingerprintPart(): String =
-        runCatching {
-            val manager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            manager?.connectionInfo?.ssid
-                .orEmpty()
-                .trim('"')
-                .normalizeFingerprintPart()
-        }.getOrDefault("")
-
-    private fun String.normalizeFingerprintPart(): String =
-        lowercase()
-            .replace(Regex("[^a-z0-9._-]+"), "-")
-            .trim('-')
-            .take(48)
 
     private fun NetworkCapabilities.profilePriority(): Int {
         val validation = if (hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) 100 else 0
