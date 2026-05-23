@@ -16,10 +16,13 @@ interface ServerHealthRepository {
     suspend fun record(snapshot: HealthSnapshot)
 
     /**
-     * Triggers an opportunistic probe of the given server. Implementation may choose to
+     * Triggers a deeper opportunistic probe of the given server. Implementation may choose to
      * dedupe against in-flight probes.
      */
     suspend fun probe(server: Server): AppResult<HealthSnapshot>
+
+    /** Cheap manual-list reachability check: DNS + TCP connect only, no speed test. */
+    suspend fun quickProbe(server: Server): AppResult<HealthSnapshot>
 
     /** Returns top-N servers by current rolling score, optionally filtered. */
     suspend fun rank(servers: List<Server>, limit: Int): List<Server>

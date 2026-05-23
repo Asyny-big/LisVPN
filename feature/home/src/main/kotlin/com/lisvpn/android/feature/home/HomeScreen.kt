@@ -24,6 +24,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
@@ -35,6 +36,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -62,6 +64,7 @@ fun HomeScreen(
     onPrimaryAction: () -> Unit,
     onConnectionModeSelected: (HomeConnectionMode) -> Unit,
     onServerSelected: (String) -> Unit,
+    onCheckServersClick: () -> Unit,
     onNavigateToServers: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onNavigateToProfiles: () -> Unit,
@@ -95,6 +98,7 @@ fun HomeScreen(
             onPrimaryAction = onPrimaryAction,
             onConnectionModeSelected = onConnectionModeSelected,
             onServerSelected = onServerSelected,
+            onCheckServersClick = onCheckServersClick,
             onNavigateToProfiles = onNavigateToProfiles,
             modifier = Modifier
                 .fillMaxSize()
@@ -110,6 +114,7 @@ private fun HomeBody(
     onPrimaryAction: () -> Unit,
     onConnectionModeSelected: (HomeConnectionMode) -> Unit,
     onServerSelected: (String) -> Unit,
+    onCheckServersClick: () -> Unit,
     onNavigateToProfiles: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -145,6 +150,12 @@ private fun HomeBody(
             }
         }
 
+        AnimatedVisibility(visible = state.autoProgress != null) {
+            state.autoProgress?.let { progress ->
+                AutoProgressCard(progress = progress)
+            }
+        }
+
         Column(
             modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -173,7 +184,7 @@ private fun HomeBody(
                         text = if (state.canDisconnect) "Отключить" else "Подключить",
                         onClick = onPrimaryAction,
                         enabled = state.canConnect || state.canDisconnect,
-                        loading = isBusy,
+                        loading = isBusy && !state.canDisconnect,
                     )
                     AnimatedVisibility(visible = state.statusMessage != null) {
                         state.statusMessage?.let { msg ->
@@ -190,6 +201,8 @@ private fun HomeBody(
                         ManualServerPicker(
                             servers = state.servers,
                             enabled = !isBusy && state.canConnect,
+                            checking = state.manualCheckInProgress,
+                            onCheckServersClick = onCheckServersClick,
                             onServerSelected = onServerSelected,
                         )
                     }
@@ -200,6 +213,86 @@ private fun HomeBody(
             }
         }
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun AutoProgressCard(progress: HomeAutoProgressUi) {
+    val colors = MaterialTheme.colorScheme
+    val containerColor = when (progress.severity) {
+        HomeAutoProgressUi.Severity.Info -> colors.surfaceVariant
+        HomeAutoProgressUi.Severity.Success -> colors.primaryContainer
+        HomeAutoProgressUi.Severity.Warning -> colors.tertiaryContainer
+        HomeAutoProgressUi.Severity.Error -> colors.errorContainer
+    }
+    val contentColor = when (progress.severity) {
+        HomeAutoProgressUi.Severity.Info -> colors.onSurfaceVariant
+        HomeAutoProgressUi.Severity.Success -> colors.onPrimaryContainer
+        HomeAutoProgressUi.Severity.Warning -> colors.onTertiaryContainer
+        HomeAutoProgressUi.Severity.Error -> colors.onErrorContainer
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = containerColor, contentColor = contentColor),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Text(
+                text = progress.title,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            progress.detail?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            progress.currentServer?.let {
+                Text(
+                    text = "Сейчас: $it",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            if (progress.progressFraction != null) {
+                LinearProgressIndicator(
+                    progress = { progress.progressFraction.coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            } else if (progress.severity == HomeAutoProgressUi.Severity.Info || progress.severity == HomeAutoProgressUi.Severity.Warning) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+            val meta = listOfNotNull(progress.progressText, progress.etaText).joinToString(" · ")
+            if (meta.isNotBlank()) {
+                Text(
+                    text = meta,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            progress.resultText?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.Medium,
+                )
+            }
+            progress.debugText?.let {
+                Text(
+                    text = it,
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
     }
 }
 
@@ -263,17 +356,31 @@ private fun RowScope.ModePill(
 private fun ManualServerPicker(
     servers: List<HomeServerOption>,
     enabled: Boolean,
+    checking: Boolean,
+    onCheckServersClick: () -> Unit,
     onServerSelected: (String) -> Unit,
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text(
-            text = "Выберите сервер",
-            style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = "Выберите сервер",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            TextButton(
+                onClick = onCheckServersClick,
+                enabled = enabled && !checking,
+            ) {
+                Text(if (checking) "Проверяем…" else "Проверить все")
+            }
+        }
         servers.forEach { server ->
             ManualServerCard(
                 server = server,
@@ -282,6 +389,21 @@ private fun ManualServerPicker(
             )
         }
     }
+}
+
+@Composable
+private fun ManualServerCheckUi.statusColor(): Color = when {
+    checking -> MaterialTheme.colorScheme.primary
+    reachable == true -> MaterialTheme.colorScheme.primary
+    reachable == false -> MaterialTheme.colorScheme.error
+    else -> MaterialTheme.colorScheme.onSurfaceVariant
+}
+
+private fun ManualServerCheckUi.statusMark(): String = when {
+    checking -> "…"
+    reachable == true -> "●"
+    reachable == false -> "⚠"
+    else -> "○"
 }
 
 @Composable
@@ -327,6 +449,25 @@ private fun ManualServerCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
+                }
+                server.check?.let { check ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            text = check.statusMark(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = check.statusColor(),
+                        )
+                        Text(
+                            text = check.label(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = check.statusColor(),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
             }
             RadioButton(

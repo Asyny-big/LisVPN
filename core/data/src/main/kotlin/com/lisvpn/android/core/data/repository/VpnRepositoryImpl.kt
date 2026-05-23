@@ -42,16 +42,14 @@ class VpnRepositoryImpl @Inject constructor(
         permission: VpnPermissionHandle,
     ): AppResult<Unit> {
         val rules = runCatching { appRulesRepository.observe().first() }.getOrDefault(AppRules.Default)
-        // We always pre-resolve the bootstrap server (and in auto-mode, every candidate that has a
-        // hostname) so sing-box dials by IPv4. Without this, server hostnames would have to be
-        // resolved through the just-opened TUN interface, which on Android with a VPN active can
-        // dead-lock against itself (the DNS query gets routed back through the tunnel that hasn't
-        // come up yet). Manual mode is the canonical example: a Reality/gRPC outbound such as
-        // govchat.ru:10443 fails with "lookup ...: i/o timeout" if the host isn't resolved
-        // up-front, even though TCP to the same IP works fine.
+        // AUTO must not block on Android's OS resolver: captive portals, broken carrier DNS and
+        // DPI can make InetAddress.getAllByName() wait for seconds before the VPN service even
+        // starts. The sing-box config already routes server-domain DNS to direct DoH, and
+        // LisVpnService runs its own bounded fast filter. Keep pre-resolve only for manual mode,
+        // where a single user-selected hostname benefits from the legacy IPv4 workaround.
         val resolvedServers = withContext(ioDispatcher) {
             servers.mapIndexed { index, server ->
-                if (smartSelection || index == 0) server.withResolvedHost() else server
+                if (!smartSelection && index == 0) server.withResolvedHost() else server
             }
         }
         return controller.start(

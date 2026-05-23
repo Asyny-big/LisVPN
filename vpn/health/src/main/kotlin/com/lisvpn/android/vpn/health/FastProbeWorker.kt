@@ -36,20 +36,24 @@ class FastProbeWorker @Inject constructor(
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher,
 ) {
 
-    suspend fun probeAll(servers: List<TaggedServer>): List<FastProbeResult> = withContext(ioDispatcher) {
+    suspend fun probeAll(
+        servers: List<TaggedServer>,
+        onProgress: (completed: Int, total: Int, reachable: Int, result: FastProbeResult) -> Unit = { _, _, _, _ -> },
+    ): List<FastProbeResult> = withContext(ioDispatcher) {
         // Mobile carriers (especially Russian ones on a whitelisted IP plan) tend to NAT-collapse
-        // or throttle bursts of parallel TLS handshakes from the same device, which the
-        // hard-coded `FAST_PROBE_PARALLELISM = 12` used to provoke — we'd lose 4-5 healthy servers
-        // to spurious "timeout" results on every connect. Halving the parallelism on mobile-like
-        // networks fixes that without slowing down Wi-Fi/Ethernet users.
-        val parallelism = if (isMobileLikeNetwork()) FAST_PROBE_PARALLELISM_MOBILE else FAST_PROBE_PARALLELISM_FIXED
-        val semaphore = Semaphore(parallelism)
+        // or throttle bursts of parallel TLS handshakes from the same device. We therefore use a
+        // lower worker-pool and shorter per-candidate budgets on cellular: dead routes fail in
+        // ~1.5s, while healthy TCP/REALITY endpoints usually return in a single RTT.
+        val budget = if (isMobileLikeNetwork()) FastProbeBudget.Mobile else FastProbeBudget.Fixed
+        val semaphore = Semaphore(budget.parallelism)
+        val completed = java.util.concurrent.atomic.AtomicInteger(0)
+        val reachable = java.util.concurrent.atomic.AtomicInteger(0)
         coroutineScope {
             servers.map { tagged ->
                 async {
-                    semaphore.withPermit {
-                        withTimeoutOrNull(FAST_PROBE_TOTAL_TIMEOUT_MS) {
-                            probe(tagged)
+                    val result = semaphore.withPermit {
+                        withTimeoutOrNull(budget.totalTimeoutMs) {
+                            probe(tagged, budget)
                         } ?: FastProbeResult(
                             taggedServer = tagged,
                             dnsMs = null,
@@ -60,12 +64,16 @@ class FastProbeWorker @Inject constructor(
                             failureReason = "timeout",
                         )
                     }
+                    val done = completed.incrementAndGet()
+                    val ok = if (result.success) reachable.incrementAndGet() else reachable.get()
+                    onProgress(done, servers.size, ok, result)
+                    result
                 }
             }.awaitAll()
         }
     }
 
-    private fun probe(tagged: TaggedServer): FastProbeResult {
+    private fun probe(tagged: TaggedServer, budget: FastProbeBudget): FastProbeResult {
         val server = tagged.server
         val startedAt = SystemClock.elapsedRealtime()
         val host = server.outbound.host.trim().removeSuffix(".")
@@ -92,10 +100,10 @@ class FastProbeWorker @Inject constructor(
             val socket = Socket()
             try {
                 socket.tcpNoDelay = true
-                socket.soTimeout = SOCKET_READ_TIMEOUT_MS
-                socket.connect(InetSocketAddress(address, port), TCP_CONNECT_TIMEOUT_MS)
+                socket.soTimeout = budget.socketReadTimeoutMs
+                socket.connect(InetSocketAddress(address, port), budget.tcpConnectTimeoutMs)
                 val tcpMs = elapsedSince(tcpStartedAt)
-                val tlsMs = measureTlsIfNeeded(socket, host, server)
+                val tlsMs = measureTlsIfNeeded(socket, host, server, budget)
                 if (tlsMs == TLS_FAILED) {
                     return failed(tagged, dnsMs, tcpMs, null, "tls handshake failed")
                 }
@@ -126,7 +134,7 @@ class FastProbeWorker @Inject constructor(
         return failed(tagged, dnsMs, null, null, lastFailure)
     }
 
-    private fun measureTlsIfNeeded(socket: Socket, host: String, server: Server): Int {
+    private fun measureTlsIfNeeded(socket: Socket, host: String, server: Server, budget: FastProbeBudget): Int {
         val security = server.outbound.security()
         if (security == Security.None) return TLS_NOT_REQUIRED
         if (security is Security.Reality) return TLS_NOT_REQUIRED
@@ -137,7 +145,7 @@ class FastProbeWorker @Inject constructor(
             val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
                 .createSocket(socket, host, server.outbound.port, false) as SSLSocket
             ssl.use {
-                it.soTimeout = SOCKET_READ_TIMEOUT_MS
+                it.soTimeout = budget.socketReadTimeoutMs
                 it.sslParameters = SSLParameters().apply {
                     serverNames = listOf(SNIHostName(tls.sni ?: host))
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && tls.alpn.isNotEmpty()) {
@@ -199,12 +207,29 @@ class FastProbeWorker @Inject constructor(
         return !hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
     }
 
+    private data class FastProbeBudget(
+        val parallelism: Int,
+        val totalTimeoutMs: Long,
+        val tcpConnectTimeoutMs: Int,
+        val socketReadTimeoutMs: Int,
+    ) {
+        companion object {
+            val Fixed = FastProbeBudget(
+                parallelism = 10,
+                totalTimeoutMs = 1_500L,
+                tcpConnectTimeoutMs = 1_000,
+                socketReadTimeoutMs = 1_000,
+            )
+            val Mobile = FastProbeBudget(
+                parallelism = 4,
+                totalTimeoutMs = 1_800L,
+                tcpConnectTimeoutMs = 1_300,
+                socketReadTimeoutMs = 1_300,
+            )
+        }
+    }
+
     private companion object {
-        const val FAST_PROBE_PARALLELISM_FIXED = 12
-        const val FAST_PROBE_PARALLELISM_MOBILE = 6
-        const val FAST_PROBE_TOTAL_TIMEOUT_MS = 2_200L
-        const val TCP_CONNECT_TIMEOUT_MS = 1_500
-        const val SOCKET_READ_TIMEOUT_MS = 1_500
         const val TLS_NOT_REQUIRED = -1
         const val TLS_FAILED = -2
     }

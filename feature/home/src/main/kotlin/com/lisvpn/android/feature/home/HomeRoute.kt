@@ -49,6 +49,7 @@ private fun HomeRoute(
         },
         onConnectionModeSelected = viewModel::onConnectionModeSelected,
         onServerSelected = viewModel::onServerSelected,
+        onCheckServersClick = viewModel::onCheckServersClick,
         onNavigateToServers = onNavigateToServers,
         onNavigateToSettings = onNavigateToSettings,
         onNavigateToProfiles = if (state.showImportPrompt) onNavigateToImport else onNavigateToProfiles,

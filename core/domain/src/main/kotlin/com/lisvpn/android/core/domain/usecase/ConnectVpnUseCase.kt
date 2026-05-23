@@ -56,7 +56,10 @@ class ConnectVpnUseCase @Inject constructor(
             if (generalCandidates.isEmpty()) {
                 return AppResult.Failure(AppError.Vpn("No general-purpose VPN servers in subscription"))
             }
-            val ranked = selectBestServer(generalCandidates, limit = generalCandidates.size)
+            val ranked = selectBestServer(
+                generalCandidates,
+                limit = generalCandidates.size.coerceAtMost(AUTO_CONNECT_CANDIDATE_LIMIT),
+            )
             Timber.i(
                 "Auto connect pipeline: after scoring selectedCount=%d selected=%s",
                 ranked.size,
@@ -163,6 +166,10 @@ class ConnectVpnUseCase @Inject constructor(
         UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX.containsMatchIn(this)
 
     private companion object {
+        // Keep the sing-box selector and pre-resolve work bounded. Stage-1 inside VpnService will
+        // cheaply race these candidates; carrying hundreds of outbounds only slows cold start and
+        // does not improve perceived AUTO quality on mobile networks.
+        const val AUTO_CONNECT_CANDIDATE_LIMIT = 32
         val UNSUPPORTED_XRAY_HTTP_TRANSPORT_REGEX = Regex("([?&])type=(xhttp|splithttp)(&|#|$)", RegexOption.IGNORE_CASE)
     }
 }

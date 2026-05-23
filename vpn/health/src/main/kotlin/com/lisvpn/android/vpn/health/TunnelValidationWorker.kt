@@ -63,7 +63,9 @@ class TunnelValidationWorker @Inject constructor(
             elapsedMs = elapsedSince(startedAt),
         )
         val dnsWorks = withTimeoutOrNull(DNS_TIMEOUT_MS) {
-            runCatching { network.getAllByName(DNS_VALIDATION_HOST).isNotEmpty() }.getOrDefault(false)
+            DNS_VALIDATION_HOSTS.any { host ->
+                runCatching { network.getAllByName(host).isNotEmpty() }.getOrDefault(false)
+            }
         } == true
 
         val checks = coroutineScope {
@@ -90,7 +92,9 @@ class TunnelValidationWorker @Inject constructor(
             minSuccessfulTargets > 1 -> successfulCount >= minSuccessfulTargets
             else -> anyHttpOk
         }
-        val eligible = dnsWorks && httpEligible
+        // Do not hard-fail solely on one synthetic DNS host. If HTTPS URL checks succeeded, DNS
+        // through the VPN worked for real traffic even if a carrier/DPI blocks one validation host.
+        val eligible = httpEligible && (dnsWorks || anyHttpOk)
         TunnelValidationResult(
             serverId = serverId,
             vpnNetworkSeen = true,
@@ -108,13 +112,27 @@ class TunnelValidationWorker @Inject constructor(
             elapsedMs = null,
             reason = "vpn network not visible",
         )
-        val result = withTimeoutOrNull(HEALTH_CHECK_TIMEOUT_MS) {
-            checkEndpoint(network, HEALTH_TARGET)
+        val checks = coroutineScope {
+            HEALTH_TARGETS.map { target ->
+                async {
+                    withTimeoutOrNull(HEALTH_CHECK_TIMEOUT_MS) {
+                        checkEndpoint(network, target)
+                    } ?: ValidationEndpointResult(
+                        name = target.name,
+                        url = target.url,
+                        success = false,
+                        httpCode = null,
+                        elapsedMs = null,
+                        error = "timeout",
+                    )
+                }
+            }.awaitAll()
         }
+        val best = checks.filter { it.success }.minByOrNull { it.elapsedMs ?: Int.MAX_VALUE }
         HealthCheckResult(
-            healthy = result?.success == true,
-            elapsedMs = result?.elapsedMs,
-            reason = result?.error ?: if (result?.success == true) null else "generate_204 failed",
+            healthy = best != null,
+            elapsedMs = best?.elapsedMs,
+            reason = best?.error ?: if (best != null) null else checks.joinToString(limit = 2) { "${it.name}:${it.error ?: it.httpCode}" },
         )
     }
 
@@ -200,28 +218,40 @@ class TunnelValidationWorker @Inject constructor(
 
     private companion object {
         const val USER_AGENT = "LisVPN/TunnelValidation"
-        const val DNS_VALIDATION_HOST = "telegram.org"
-        const val DNS_TIMEOUT_MS = 2_500L
-        const val HTTP_CHECK_TIMEOUT_MS = 5_000L
-        const val HEALTH_CHECK_TIMEOUT_MS = 4_000L
-        const val HTTP_CONNECT_TIMEOUT_MS = 3_000
-        const val HTTP_READ_TIMEOUT_MS = 3_500
-        const val VPN_NETWORK_WAIT_ATTEMPTS = 12
-        const val VPN_NETWORK_WAIT_STEP_MS = 250L
+        val DNS_VALIDATION_HOSTS = listOf("telegram.org", "yandex.ru", "www.gstatic.com")
+        const val DNS_TIMEOUT_MS = 1_500L
+        const val HTTP_CHECK_TIMEOUT_MS = 2_400L
+        const val HEALTH_CHECK_TIMEOUT_MS = 2_000L
+        const val HTTP_CONNECT_TIMEOUT_MS = 1_500
+        const val HTTP_READ_TIMEOUT_MS = 1_800
+        const val VPN_NETWORK_WAIT_ATTEMPTS = 8
+        const val VPN_NETWORK_WAIT_STEP_MS = 150L
 
         val HEALTH_TARGET = ValidationTarget(
             name = "cloudflare204",
             url = "https://cp.cloudflare.com/generate_204",
             accepts = { it == 204 || it in 200..299 },
         )
+        val GOOGLE_TARGET = ValidationTarget(
+            name = "google204",
+            url = "https://www.google.com/generate_204",
+            accepts = { it == 204 || it in 200..399 },
+        )
         val TELEGRAM_TARGET = ValidationTarget(
             name = "telegram",
             url = "https://telegram.org",
             accepts = { it in 200..399 },
         )
+        val YANDEX_TARGET = ValidationTarget(
+            name = "yandex",
+            url = "https://yandex.ru/favicon.ico",
+            accepts = { it in 200..399 },
+        )
+        val HEALTH_TARGETS = listOf(HEALTH_TARGET, GOOGLE_TARGET, YANDEX_TARGET)
         val MANUAL_VALIDATION_TARGETS = listOf(
             HEALTH_TARGET,
             TELEGRAM_TARGET,
+            YANDEX_TARGET,
         )
         // Wider, DPI-diverse target set so AUTO validation does not fail entirely when one or two
         // of the targets are blocked by a carrier whitelist. We mix big-tech (cloudflare/google) and
@@ -234,22 +264,14 @@ class TunnelValidationWorker @Inject constructor(
                 url = "https://1.1.1.1/cdn-cgi/trace",
                 readBody = true,
             ),
-            ValidationTarget(
-                name = "google204",
-                url = "https://www.google.com/generate_204",
-                accepts = { it == 204 || it in 200..399 },
-            ),
+            GOOGLE_TARGET,
             TELEGRAM_TARGET,
             ValidationTarget(
                 name = "youtube",
                 url = "https://www.youtube.com/generate_204",
                 accepts = { it == 204 || it in 200..399 },
             ),
-            ValidationTarget(
-                name = "yandex",
-                url = "https://yandex.ru/favicon.ico",
-                accepts = { it in 200..399 },
-            ),
+            YANDEX_TARGET,
             ValidationTarget(
                 name = "mailru",
                 url = "https://mail.ru/favicon.ico",

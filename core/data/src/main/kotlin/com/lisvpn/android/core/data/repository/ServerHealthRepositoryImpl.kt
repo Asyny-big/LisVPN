@@ -16,6 +16,7 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
+import android.os.SystemClock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.map
@@ -26,6 +27,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.datetime.Clock
 import kotlin.math.roundToInt
 import timber.log.Timber
+import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 
 /**
  * Stores health samples and provides the AUTO bootstrap order. Heavy optimization is intentionally
@@ -98,6 +103,66 @@ class ServerHealthRepositoryImpl @Inject constructor(
             Timber.w(e, "Protocol validation crashed: server=%s", server.displayName)
             AppResult.Failure(AppError.from(e), e)
         }
+    }
+
+    override suspend fun quickProbe(server: Server): AppResult<HealthSnapshot> = withContext(ioDispatcher) {
+        try {
+            val snapshot = quickTcpSnapshot(server)
+            record(snapshot)
+            if (snapshot.success) {
+                Timber.i(
+                    "Quick server check success: server=%s tcp=%sms",
+                    server.displayName,
+                    snapshot.tcpHandshakeMs,
+                )
+            } else {
+                Timber.w("Quick server check failed: server=%s", server.displayName)
+            }
+            AppResult.Success(snapshot)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            Timber.w(e, "Quick server check crashed: server=%s", server.displayName)
+            AppResult.Failure(AppError.from(e), e)
+        }
+    }
+
+    private fun quickTcpSnapshot(server: Server): HealthSnapshot {
+        val startedAt = SystemClock.elapsedRealtime()
+        val host = server.outbound.host.trim().removeSuffix(".")
+        val port = server.outbound.port
+        if (host.isBlank() || port <= 0) return failedSnapshot(server)
+        val addresses = runCatching {
+            InetAddress.getAllByName(host)
+                .filterIsInstance<Inet4Address>()
+                .ifEmpty { InetAddress.getAllByName(host).toList() }
+                .take(QUICK_PROBE_MAX_ADDRESSES)
+        }.getOrDefault(emptyList())
+        if (addresses.isEmpty()) return failedSnapshot(server)
+        for (address in addresses) {
+            val tcpStartedAt = SystemClock.elapsedRealtime()
+            val ok = runCatching {
+                Socket().use { socket ->
+                    socket.tcpNoDelay = true
+                    socket.connect(InetSocketAddress(address, port), QUICK_PROBE_CONNECT_TIMEOUT_MS)
+                    socket.isConnected
+                }
+            }.getOrDefault(false)
+            if (ok) {
+                return HealthSnapshot(
+                    serverId = server.id,
+                    timestamp = Clock.System.now(),
+                    tcpHandshakeMs = (SystemClock.elapsedRealtime() - tcpStartedAt).toInt().coerceAtLeast(1),
+                    tlsHandshakeMs = null,
+                    httpRttMs = null,
+                    success = true,
+                    networkType = HealthSnapshot.NetworkType.Unknown,
+                )
+            }
+        }
+        return failedSnapshot(server).copy(
+            tcpHandshakeMs = (SystemClock.elapsedRealtime() - startedAt).toInt().coerceAtLeast(1),
+        )
     }
 
     private suspend fun probeWithRetry(server: Server): ProtocolProbeResult {
@@ -288,6 +353,8 @@ class ServerHealthRepositoryImpl @Inject constructor(
         const val PROTOCOL_PROBE_TIMEOUT_MS = 16_000L
         const val MANUAL_PROBE_ATTEMPTS = 2
         const val MANUAL_PROBE_RETRY_DELAY_MS = 250L
+        const val QUICK_PROBE_CONNECT_TIMEOUT_MS = 1_200
+        const val QUICK_PROBE_MAX_ADDRESSES = 2
         const val MAX_TOTAL_SAMPLES = 500
         const val MAX_SAMPLES_PER_SERVER = 12
         const val MAX_SCORE_PING_MS = 1_500
