@@ -574,7 +574,7 @@ class LisVpnService : VpnService() {
             )
         }
         val rankedFallbackCandidates = scoreCalculator.rankFastResults(
-            fastResults = fallbackResults.filter { it.success },
+            fastResults = fallbackResults,
             histories = plan.histories,
             profile = plan.profile,
         )
