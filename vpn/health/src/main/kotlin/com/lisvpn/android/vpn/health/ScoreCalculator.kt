@@ -38,20 +38,41 @@ class ScoreCalculator @Inject constructor() {
     ): List<AutoSelectionCandidate> =
         fastResults
             .asSequence()
-            .filter { it.success }
-            .map { result ->
-                AutoSelectionCandidate(
-                    taggedServer = result.taggedServer,
-                    fastProbe = result,
-                    history = histories[result.taggedServer.server.id],
-                )
-            }
-            .sortedWith(
-                compareByDescending<AutoSelectionCandidate> { it.fastScore(profile) }
-                    .thenBy { it.fastProbe.latencyMs ?: Int.MAX_VALUE },
-            )
+            .toAutoSelectionCandidates(histories)
+            .rankByFastScore(profile)
             .take(limit.coerceAtLeast(1))
             .toList()
+
+    fun rankFastResults(
+        fastResults: List<FastProbeResult>,
+        histories: Map<String, SmartServerHistory>,
+        profile: SmartNetworkProfile,
+    ): List<AutoSelectionCandidate> =
+        fastResults
+            .asSequence()
+            .filter { it.success }
+            .toAutoSelectionCandidates(histories)
+            .rankByFastScore(profile)
+            .toList()
+
+    private fun Sequence<FastProbeResult>.toAutoSelectionCandidates(
+        histories: Map<String, SmartServerHistory>,
+    ): Sequence<AutoSelectionCandidate> =
+        map { result ->
+            AutoSelectionCandidate(
+                taggedServer = result.taggedServer,
+                fastProbe = result,
+                history = histories[result.taggedServer.server.id],
+            )
+        }
+
+    private fun Sequence<AutoSelectionCandidate>.rankByFastScore(
+        profile: SmartNetworkProfile,
+    ): Sequence<AutoSelectionCandidate> =
+        sortedWith(
+            compareByDescending<AutoSelectionCandidate> { it.fastScore(profile) }
+                .thenBy { it.fastProbe.latencyMs ?: Int.MAX_VALUE },
+        )
 
     fun score(
         candidate: AutoSelectionCandidate,

@@ -46,6 +46,13 @@ class ProfileRepositoryImpl @Inject constructor(
     override fun observeProfiles(): Flow<List<Profile>> =
         profileDao.observeProfiles().map { list -> list.map { it.toDomain() } }
 
+    override suspend fun listSubscriptionProfiles(): AppResult<List<Profile>> = withContext(ioDispatcher) {
+        AppResult.Success(
+            profileDao.getProfilesBySourceType(ProfileSourceDb.TYPE_SUBSCRIPTION_URL)
+                .map { it.toDomain() },
+        )
+    }
+
     override fun observeServers(profileId: String): Flow<List<Server>> =
         profileDao.observeServers(profileId).map { list -> list.map { it.toDomain(secretBox) } }
 
