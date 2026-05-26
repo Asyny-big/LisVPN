@@ -281,7 +281,7 @@ class LisVpnService : VpnService() {
                 ),
             )
         }
-        val shortlist = scoreCalculator.shortlist(
+        val rankedFastCandidates = scoreCalculator.shortlist(
             fastResults = fastResults,
             histories = histories,
             profile = profile,
@@ -295,25 +295,22 @@ class LisVpnService : VpnService() {
             fastTargets.size,
             fastResults.count { it.success },
             stickyServerIds.joinToString(),
-            shortlist.joinToString { "${it.server.displayName}/${it.fastProbe.latencyMs}ms" },
+            rankedFastCandidates.joinToString { "${it.server.displayName}/${it.fastProbe.latencyMs}ms" },
             fastResults.filterNot { it.success }.take(6).joinToString { "${it.taggedServer.server.displayName}:${it.failureReason}" },
             elapsedSince(fastStageStartedAt),
         )
-        if (shortlist.isEmpty()) {
-            autoOptimizerRepository.report(
-                AutoOptimizerStatus.Failed(
-                    reason = "Нет доступных серверов после быстрой проверки",
-                    stage = AutoOptimizerStage.FastFilter,
-                    tested = fastResults.size,
-                    total = fastTargets.size,
-                    debugSummary = fastResults.take(8).joinToString { "${it.taggedServer.server.displayName}:${it.failureReason ?: it.latencyMs}" },
-                ),
+        if (rankedFastCandidates.isEmpty()) {
+            Timber.w(
+                "AUTO initial fast filter found no reachable candidates; expanding search to remaining servers initial=%d total=%d",
+                fastResults.size,
+                tagged.size,
             )
-            return null
         }
         return AutoSelectionPlan(
             profile = profile,
-            shortlist = shortlist,
+            rankedFastCandidates = rankedFastCandidates,
+            allCandidates = tagged,
+            histories = histories,
             fastResults = fastResults,
             selectionStartedAtMs = selectionStartedAt,
         )
@@ -323,8 +320,19 @@ class LisVpnService : VpnService() {
         runningBridge: LibboxBridge,
         plan: AutoSelectionPlan,
     ): AutoSelectionResult? {
-        val validationLimit = validationLimit(plan.profile)
-        val validationCandidates = plan.shortlist.take(validationLimit)
+        val validationCandidates = buildTunnelValidationCandidates(plan)
+        if (validationCandidates.isEmpty()) {
+            autoOptimizerRepository.report(
+                AutoOptimizerStatus.Failed(
+                    reason = "Нет доступных серверов после быстрой проверки",
+                    stage = AutoOptimizerStage.FastFilter,
+                    tested = plan.fastResults.size,
+                    total = plan.allCandidates.size,
+                    debugSummary = plan.fastResults.take(8).joinToString { "${it.taggedServer.server.displayName}:${it.failureReason ?: it.latencyMs}" },
+                ),
+            )
+            return null
+        }
         val scored = mutableListOf<ScoredAutoServer>()
         var bestSoFar: ScoredAutoServer? = null
         val validationStartedAt = SystemClock.elapsedRealtime()
@@ -519,6 +527,69 @@ class LisVpnService : VpnService() {
         return stickyHealthy && tested >= 1 && speedKbps >= AUTO_STICKY_ACCEPT_SPEED_KBPS
     }
 
+    private suspend fun buildTunnelValidationCandidates(plan: AutoSelectionPlan): List<AutoSelectionCandidate> {
+        val limit = validationLimit(plan.profile)
+        val ordered = linkedMapOf<String, AutoSelectionCandidate>()
+        fun add(candidate: AutoSelectionCandidate) {
+            ordered.putIfAbsent(candidate.server.id, candidate)
+        }
+
+        plan.rankedFastCandidates.take(limit).forEach(::add)
+        if (ordered.size >= plan.allCandidates.size) return ordered.values.toList()
+
+        val alreadyFastProbed = plan.fastResults.map { it.taggedServer.server.id }.toSet()
+        val fallbackTargets = plan.allCandidates.filter { it.server.id !in alreadyFastProbed }
+        if (fallbackTargets.isEmpty()) return ordered.values.toList()
+
+        autoOptimizerRepository.report(
+            AutoOptimizerStatus.Probing(
+                current = plan.fastResults.size,
+                total = plan.allCandidates.size,
+                serverDisplayName = "",
+                stage = AutoOptimizerStage.FastFilter,
+                stageMessage = "Расширяем поиск рабочих маршрутов…",
+                progressPercent = progressPercent(plan.fastResults.size, plan.allCandidates.size),
+                checked = plan.fastResults.size,
+                reachable = plan.fastResults.count { it.success },
+                debugSummary = "fallback=${fallbackTargets.size} initial=${plan.fastResults.size}/${plan.allCandidates.size}",
+            ),
+        )
+
+        val fallbackStartedAt = SystemClock.elapsedRealtime()
+        val fallbackResults = fastProbeWorker.probeAll(fallbackTargets) { completed, total, reachable, result ->
+            val checked = plan.fastResults.size + completed
+            autoOptimizerRepository.report(
+                AutoOptimizerStatus.Probing(
+                    current = checked,
+                    total = plan.allCandidates.size,
+                    serverDisplayName = result.taggedServer.server.displayName,
+                    stage = AutoOptimizerStage.FastFilter,
+                    stageMessage = "Проверяем дополнительные маршруты",
+                    progressPercent = progressPercent(checked, plan.allCandidates.size),
+                    estimatedRemainingMs = estimateRemainingMs(fallbackStartedAt, completed, total),
+                    checked = checked,
+                    reachable = plan.fastResults.count { it.success } + reachable,
+                    debugSummary = "last=${if (result.success) "ok/${result.latencyMs}ms" else result.failureReason}",
+                ),
+            )
+        }
+        val rankedFallbackCandidates = scoreCalculator.rankFastResults(
+            fastResults = fallbackResults.filter { it.success },
+            histories = plan.histories,
+            profile = plan.profile,
+        )
+        rankedFallbackCandidates.forEach(::add)
+
+        Timber.i(
+            "AUTO telemetry stage=fallback_fast_filter initial=%d fallback=%d fallbackReachable=%d totalValidationCandidates=%d",
+            plan.fastResults.size,
+            fallbackResults.size,
+            fallbackResults.count { it.success },
+            ordered.size,
+        )
+        return ordered.values.toList()
+    }
+
     private suspend fun validateManualTunnel(
         @Suppress("UNUSED_PARAMETER") runningBridge: LibboxBridge,
         server: Server,
@@ -708,7 +779,9 @@ class LisVpnService : VpnService() {
 
     private data class AutoSelectionPlan(
         val profile: SmartNetworkProfile,
-        val shortlist: List<AutoSelectionCandidate>,
+        val rankedFastCandidates: List<AutoSelectionCandidate>,
+        val allCandidates: List<TaggedServer>,
+        val histories: Map<String, SmartServerHistory>,
         val fastResults: List<FastProbeResult>,
         val selectionStartedAtMs: Long,
     )

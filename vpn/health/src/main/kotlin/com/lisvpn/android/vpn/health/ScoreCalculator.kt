@@ -53,6 +53,26 @@ class ScoreCalculator @Inject constructor() {
             .take(limit.coerceAtLeast(1))
             .toList()
 
+    fun rankFastResults(
+        fastResults: List<FastProbeResult>,
+        histories: Map<String, SmartServerHistory>,
+        profile: SmartNetworkProfile,
+    ): List<AutoSelectionCandidate> =
+        fastResults
+            .asSequence()
+            .map { result ->
+                AutoSelectionCandidate(
+                    taggedServer = result.taggedServer,
+                    fastProbe = result,
+                    history = histories[result.taggedServer.server.id],
+                )
+            }
+            .sortedWith(
+                compareByDescending<AutoSelectionCandidate> { it.fastScore(profile) }
+                    .thenBy { it.fastProbe.latencyMs ?: Int.MAX_VALUE },
+            )
+            .toList()
+
     fun score(
         candidate: AutoSelectionCandidate,
         validation: TunnelValidationResult,
