@@ -281,11 +281,10 @@ class LisVpnService : VpnService() {
                 ),
             )
         }
-        val rankedFastCandidates = scoreCalculator.shortlist(
+        val rankedFastCandidates = scoreCalculator.rankFastResults(
             fastResults = fastResults,
             histories = histories,
             profile = profile,
-            limit = AUTO_SHORTLIST_LIMIT,
         )
         Timber.i(
             "AUTO telemetry stage=fast_filter network=%s fingerprint=%s total=%d probed=%d reachable=%d sticky=%s shortlist=%s failures=%s elapsedMs=%d",
@@ -295,7 +294,7 @@ class LisVpnService : VpnService() {
             fastTargets.size,
             fastResults.count { it.success },
             stickyServerIds.joinToString(),
-            rankedFastCandidates.joinToString { "${it.server.displayName}/${it.fastProbe.latencyMs}ms" },
+            rankedFastCandidates.take(AUTO_SHORTLIST_LIMIT).joinToString { "${it.server.displayName}/${it.fastProbe.latencyMs}ms" },
             fastResults.filterNot { it.success }.take(6).joinToString { "${it.taggedServer.server.displayName}:${it.failureReason}" },
             elapsedSince(fastStageStartedAt),
         )
@@ -535,6 +534,7 @@ class LisVpnService : VpnService() {
         }
 
         plan.rankedFastCandidates.take(limit).forEach(::add)
+        plan.rankedFastCandidates.drop(limit).forEach(::add)
         if (ordered.size >= plan.allCandidates.size) return ordered.values.toList()
 
         val alreadyFastProbed = plan.fastResults.map { it.taggedServer.server.id }.toSet()
