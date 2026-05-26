@@ -11,6 +11,8 @@ interface ProfileRepository {
     /** All profiles known to the app. */
     fun observeProfiles(): Flow<List<Profile>>
 
+    suspend fun listSubscriptionProfiles(): AppResult<List<Profile>>
+
     /** Servers belonging to a given profile. */
     fun observeServers(profileId: String): Flow<List<Server>>
 

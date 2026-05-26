@@ -6,6 +6,7 @@ import androidx.work.Configuration
 import com.lisvpn.android.core.common.logging.LisFileLogTree
 import com.lisvpn.android.core.common.logging.LisLogExporter
 import com.lisvpn.android.core.common.logging.LisLogTree
+import com.lisvpn.android.subscription.SubscriptionRefreshWorker
 import dagger.hilt.android.HiltAndroidApp
 import javax.inject.Inject
 import timber.log.Timber
@@ -45,6 +46,7 @@ class LisVpnApp : Application(), Configuration.Provider {
             }
             previousUncaughtHandler?.uncaughtException(thread, throwable)
         }
+        SubscriptionRefreshWorker.schedule(this)
         Timber.i("LisVPN application created (versionName=%s, applicationId=%s)", BuildConfig.VERSION_NAME, BuildConfig.APPLICATION_ID)
     }
 }

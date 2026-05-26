@@ -14,6 +14,9 @@ interface ProfileDao {
     @Query("SELECT * FROM profile ORDER BY isPrimary DESC, createdAtMs ASC")
     fun observeProfiles(): Flow<List<ProfileEntity>>
 
+    @Query("SELECT * FROM profile WHERE sourceType = :sourceType ORDER BY isPrimary DESC, createdAtMs ASC")
+    suspend fun getProfilesBySourceType(sourceType: String): List<ProfileEntity>
+
     @Query("SELECT * FROM profile WHERE isPrimary = 1 LIMIT 1")
     fun observePrimaryProfile(): Flow<ProfileEntity?>
 
